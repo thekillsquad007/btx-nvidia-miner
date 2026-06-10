@@ -170,13 +170,13 @@ fi
 
 cd "$SRC_DIR"
 
-# Build
+# Build - always clean to avoid stale CMake cache (e.g. old "native" arch)
+rm -rf build
 mkdir -p build
 cd build
 echo "Configuring (CUDA enabled)..."
 cmake -DCMAKE_BUILD_TYPE=Release \
       -DBTX_MINER_ENABLE_CUDA=ON \
-      -DCUDA_ARCHS="native" \
       ..
 
 echo "Building (this can take a while on first build)..."
