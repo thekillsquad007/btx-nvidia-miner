@@ -189,6 +189,12 @@ int main(int argc, char** argv)
         }
 
         std::cout << "btx-miner v" << btx::common::kMinerVersion << " — pool mining " << host << ":" << port << " as " << user << std::endl;
+        if (intensity < 10000) {
+            std::cerr << "WARNING: --intensity " << intensity
+                      << " limits each slice to only " << intensity << " nonces (~"
+                      << (intensity * 4 / 1000) << "k/s overhead). Omit --intensity for 5s slices; "
+                      << "use --batch for CUDA launch size." << std::endl;
+        }
         std::cout << "Slice=" << slice_seconds << "s cap=" << intensity
                   << " nonces, batch=" << batch;
         if (devices_spec != "all") std::cout << ", devices=" << devices_spec;
