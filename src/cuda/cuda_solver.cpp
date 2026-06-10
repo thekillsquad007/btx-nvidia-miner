@@ -8,8 +8,9 @@
 
 #include <algorithm>
 #include <cstring>
-#include <vector>
+#include <mutex>
 #include <thread>
+#include <vector>
 
 namespace btx {
 namespace cuda {
@@ -127,33 +128,51 @@ std::vector<CudaSolution> SolveBatchCuda(
     }
 #endif
 
-    // CPU reference fallback (used when no CUDA, no usable GPU, or CUDA not enabled)
-    uint64_t current_nonce = start_nonce;
-    uint64_t remaining = max_tries;
+    // CPU reference fallback (used when no CUDA, no usable GPU, or CUDA not enabled).
+    // Use all cores — 512^3 matmul is ~0.5s/nonce on a typical CPU.
+    const unsigned hw_threads = std::max(1u, std::thread::hardware_concurrency());
+    const unsigned num_threads = std::min(hw_threads, 16u);
 
-    while (remaining > 0) {
-        uint256 d;
-        if (pow::VerifySolution(job, current_nonce, job.time, d)) {
-            const uint8_t* dd = reinterpret_cast<const uint8_t*>(&d);
-            bool below = true;
-            for (size_t k = 0; k < job.target.size() && k < 32; ++k) {
-                if (dd[k] > job.target[k]) { below = false; break; }
-                if (dd[k] < job.target[k]) break;
+    struct ThreadResult {
+        std::mutex mu;
+        std::vector<CudaSolution> found;
+    } shared;
+
+    std::vector<std::thread> workers;
+    workers.reserve(num_threads);
+
+    const uint64_t per_thread = (max_tries + num_threads - 1) / num_threads;
+    for (unsigned t = 0; t < num_threads; ++t) {
+        workers.emplace_back([&, t]() {
+            const uint64_t thread_start = start_nonce + static_cast<uint64_t>(t) * per_thread;
+            const uint64_t thread_end = std::min(start_nonce + max_tries, thread_start + per_thread);
+            for (uint64_t current = thread_start; current < thread_end; ++current) {
+                uint256 d;
+                if (pow::VerifySolution(job, current, job.time, d)) {
+                    const uint8_t* dd = reinterpret_cast<const uint8_t*>(&d);
+                    bool below = true;
+                    for (size_t k = 0; k < job.target.size() && k < 32; ++k) {
+                        if (dd[k] > job.target[k]) { below = false; break; }
+                        if (dd[k] < job.target[k]) break;
+                    }
+                    if (below) {
+                        CudaSolution sol;
+                        sol.found = true;
+                        sol.nonce = current;
+                        sol.ntime = job.time;
+                        sol.digest = d;
+                        std::lock_guard<std::mutex> lk(shared.mu);
+                        shared.found.push_back(sol);
+                    }
+                }
             }
-            if (below) {
-                CudaSolution sol;
-                sol.found = true;
-                sol.nonce = current_nonce;
-                sol.ntime = job.time;
-                sol.digest = d;
-                solutions.push_back(sol);
-            }
-        }
-        if (current_nonce == UINT64_MAX) break;
-        ++current_nonce;
-        --remaining;
+        });
     }
-    return solutions;
+
+    for (auto& w : workers) {
+        if (w.joinable()) w.join();
+    }
+    return shared.found;
 }
 
 } // namespace cuda

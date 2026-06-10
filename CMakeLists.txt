@@ -158,6 +158,7 @@ if(BTX_MINER_BUILD_TESTS)
         tests/test_pow.cpp
         ${POW_SOURCES}
         ${COMMON_SOURCES}
+        src/stratum/stratum_protocol.cpp
     )
     target_include_directories(btx-miner-test PRIVATE src include)
     target_link_libraries(btx-miner-test PRIVATE Threads::Threads)

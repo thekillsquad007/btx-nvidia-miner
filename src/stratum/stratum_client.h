@@ -38,12 +38,19 @@ struct StratumJob {
 // Callback when a solution is found by the solver for a job.
 using SolutionCallback = std::function<void(const StratumJob& job, uint64_t nonce, uint32_t ntime, const uint256& digest, bool is_block)>;
 
+struct StratumConfig {
+    int nonces_per_slice = 256;
+    int max_batch_size = 64;
+    bool verbose = false;
+};
+
 class StratumClient {
 public:
     StratumClient(const std::string& host, uint16_t port,
                   const std::string& user, const std::string& pass,
                   SolutionCallback on_solution,
-                  bool use_tls = false);
+                  bool use_tls = false,
+                  StratumConfig config = {});
 
     ~StratumClient();
 
