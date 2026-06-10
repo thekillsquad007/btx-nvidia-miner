@@ -484,17 +484,39 @@ bool ParseRpcResult(const std::string& line, uint64_t id, bool& ok, std::string&
     }
     if (result_false) {
         ok = false;
-        return true;
-    }
-    if (err_null && result_false) {
-        ok = false;
-        return true;
     }
 
     size_t err_pos = line.find("\"error\":");
-    if (err_pos != std::string::npos && line.find("\"error\":null", err_pos) == std::string::npos) {
-        error = line.substr(err_pos, std::min<size_t>(120, line.size() - err_pos));
+    if (err_pos != std::string::npos &&
+        line.find("\"error\":null", err_pos) == std::string::npos &&
+        line.find("\"error\": null", err_pos) == std::string::npos) {
+        const size_t arr_start = line.find('[', err_pos);
+        if (arr_start != std::string::npos) {
+            const size_t arr_end = line.find(']', arr_start);
+            if (arr_end != std::string::npos) {
+                const std::string arr = line.substr(arr_start + 1, arr_end - arr_start - 1);
+                int code = 0;
+                if (std::sscanf(arr.c_str(), "%d", &code) == 1) {
+                    error = "code-" + std::to_string(code);
+                }
+                const size_t msg_start = arr.find('"');
+                if (msg_start != std::string::npos) {
+                    const size_t msg_end = arr.find('"', msg_start + 1);
+                    if (msg_end != std::string::npos) {
+                        const std::string msg = arr.substr(msg_start + 1, msg_end - msg_start - 1);
+                        if (!error.empty()) error += ": ";
+                        error += msg;
+                    }
+                }
+            }
+        }
+        if (error.empty()) {
+            error = line.substr(err_pos, std::min<size_t>(200, line.size() - err_pos));
+        }
+    } else if (!ok && error.empty() && result_false) {
+        error = "result=false (no error detail)";
     }
+
     return true;
 }
 

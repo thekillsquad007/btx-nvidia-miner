@@ -8,6 +8,9 @@
 namespace btx {
 namespace pow {
 
+// Post-fork height: per-nonce seed_a/seed_b via DeterministicMatMulSeedV2.
+constexpr uint32_t kMatMulSeedV2Height = 125000;
+
 // Minimal job description for both solo and stratum.
 struct MatMulJob {
     uint32_t n = 512;
@@ -33,6 +36,21 @@ struct MatMulJob {
 
 // Saturating left-shift of a 32-byte arith_uint256 target (matches btx SaturatingLeftShift256).
 std::vector<uint8_t> PreHashTargetShift(const std::vector<uint8_t>& target, uint32_t epsilon_bits);
+
+// BTX v0.32.3 per-nonce seed derivation (height >= kMatMulSeedV2Height).
+uint256 DeterministicMatMulSeedV2(
+    const uint256& prev_hash,
+    int32_t height,
+    int32_t version,
+    const uint256& merkle_root,
+    uint32_t time,
+    uint32_t bits,
+    uint64_t nonce64,
+    uint16_t matmul_dim,
+    uint8_t which);
+
+// Pre-hash sigma gate: SHA sigma bytes vs arith-layout block target (MSB-first byte compare).
+bool SigmaBelowPreHashTarget(const uint8_t sigma[32], const std::vector<uint8_t>& target_arith);
 
 // Result of a solve attempt.
 struct MatMulSolution {

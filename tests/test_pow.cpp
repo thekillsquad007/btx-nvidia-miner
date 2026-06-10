@@ -90,6 +90,29 @@ static void test_pre_hash_target_shift()
     assert(pre[1] == 0xff);
 }
 
+static void test_matmul_seed_v2()
+{
+    btx::stratum::StratumJob job;
+    const std::string line = R"({"id":null,"method":"mining.notify","params":["0000000000002c88",536870912,"e41768fe0c8ed2d40b967c981e3af7cddf6fc495f844563836756fa76a0d2ec9","fe14530b149adfa21a45f7d2666f3c2dbef7296333398ba208ab77ea6b44a6e2",1781098511,"1d14bd00","000052f400000000000000000000000000000000000000000000000000000000",true,{"block_height":126655,"epsilon_bits":18,"matmul_b":16,"matmul_n":512,"matmul_r":8,"nonce64_start":26336739459072,"seed_a":"a6f74b5acf03e8b9955f1e8503045f868223e6a21add4bd1d287df4828f232c6","seed_b":"a257d5579fb72a5bbee627db164336b8aea91095af751ddbae91de568da04597"}]})";
+    assert(btx::stratum::ParseNotifyLine(line, job));
+    btx::pow::MatMulJob pjob;
+    assert(btx::stratum::StratumJobToPowJob(job, pjob));
+    assert(pjob.block_height >= btx::pow::kMatMulSeedV2Height);
+
+    const uint64_t nonce = pjob.nonce_start;
+    const auto seed_a0 = btx::pow::DeterministicMatMulSeedV2(
+        pjob.prev_hash, static_cast<int32_t>(pjob.block_height), pjob.version,
+        pjob.merkle_root, pjob.time, pjob.bits, nonce,
+        static_cast<uint16_t>(pjob.n), 0);
+    const auto seed_a1 = btx::pow::DeterministicMatMulSeedV2(
+        pjob.prev_hash, static_cast<int32_t>(pjob.block_height), pjob.version,
+        pjob.merkle_root, pjob.time, pjob.bits, nonce + 1,
+        static_cast<uint16_t>(pjob.n), 0);
+    assert(seed_a0 != pjob.seed_a);
+    assert(seed_a0 != seed_a1);
+    assert(seed_a0.GetHex() == "8e68504090fbe15edcdc74efac76977185d2a63f42ea34ddb6357379e138a5e2");
+}
+
 static void test_live_job_no_false_positives()
 {
     const std::string line = R"({"id":null,"method":"mining.notify","params":["0000000000002c88",536870912,"e41768fe0c8ed2d40b967c981e3af7cddf6fc495f844563836756fa76a0d2ec9","fe14530b149adfa21a45f7d2666f3c2dbef7296333398ba208ab77ea6b44a6e2",1781098511,"1d14bd00","000052f400000000000000000000000000000000000000000000000000000000",true,{"block_height":126655,"epsilon_bits":18,"matmul_b":16,"matmul_n":512,"matmul_r":8,"nonce64_start":26336739459072,"seed_a":"a6f74b5acf03e8b9955f1e8503045f868223e6a21add4bd1d287df4828f232c6","seed_b":"a257d5579fb72a5bbee627db164336b8aea91095af751ddbae91de568da04597"}]})";
@@ -135,6 +158,7 @@ int main()
     test_parse_subscribe();
     test_parse_pool_url();
     test_pre_hash_target_shift();
+    test_matmul_seed_v2();
     test_live_job_no_false_positives();
     test_pow_smoke();
     std::cout << "All pow/stratum tests passed." << std::endl;

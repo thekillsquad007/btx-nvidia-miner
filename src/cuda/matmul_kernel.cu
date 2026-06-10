@@ -30,6 +30,7 @@ struct CudaJobParams {
     uint32_t b;
     uint32_t r;
     uint32_t epsilon_bits;
+    uint32_t block_height;
     uint8_t prev_hash[32];
     uint8_t merkle_root[32];
     uint8_t seed_a[32];
@@ -327,7 +328,96 @@ __device__ void d_derive_noise_seed(const char* domain_tag, const uint8_t* sigma
     }
 }
 
-__device__ void d_derive_sigma(const CudaJobParams& job, uint64_t nonce64, uint8_t* sigma_internal)
+__device__ void d_write_compact_size(Sha256State& hasher, uint64_t val)
+{
+    if (val < 253) {
+        const uint8_t c = static_cast<uint8_t>(val);
+        d_sha256_update(&hasher, &c, 1);
+    } else if (val < 0x10000) {
+        const uint8_t buf[3] = {
+            0xFD,
+            static_cast<uint8_t>(val),
+            static_cast<uint8_t>(val >> 8),
+        };
+        d_sha256_update(&hasher, buf, 3);
+    } else if (val < 0x100000000ULL) {
+        const uint8_t buf[5] = {
+            0xFE,
+            static_cast<uint8_t>(val),
+            static_cast<uint8_t>(val >> 8),
+            static_cast<uint8_t>(val >> 16),
+            static_cast<uint8_t>(val >> 24),
+        };
+        d_sha256_update(&hasher, buf, 5);
+    } else {
+        const uint8_t buf[9] = {
+            0xFF,
+            static_cast<uint8_t>(val),
+            static_cast<uint8_t>(val >> 8),
+            static_cast<uint8_t>(val >> 16),
+            static_cast<uint8_t>(val >> 24),
+            static_cast<uint8_t>(val >> 32),
+            static_cast<uint8_t>(val >> 40),
+            static_cast<uint8_t>(val >> 48),
+            static_cast<uint8_t>(val >> 56),
+        };
+        d_sha256_update(&hasher, buf, 9);
+    }
+}
+
+__device__ void d_matmul_seed_v2(
+    const CudaJobParams& job,
+    uint64_t nonce64,
+    uint8_t which,
+    uint8_t out_internal[32])
+{
+    Sha256State hasher;
+    d_sha256_init(&hasher);
+    static const char kTag[] = "BTX_MATMUL_SEED_V2";
+    d_write_compact_size(hasher, sizeof(kTag) - 1);
+    d_sha256_update(&hasher, reinterpret_cast<const uint8_t*>(kTag), sizeof(kTag) - 1);
+    d_sha256_update(&hasher, job.prev_hash, 32);
+
+    uint8_t le[8];
+    le[0] = static_cast<uint8_t>(job.block_height & 0xff);
+    le[1] = static_cast<uint8_t>((job.block_height >> 8) & 0xff);
+    le[2] = static_cast<uint8_t>((job.block_height >> 16) & 0xff);
+    le[3] = static_cast<uint8_t>((job.block_height >> 24) & 0xff);
+    d_sha256_update(&hasher, le, 4);
+    le[0] = static_cast<uint8_t>(job.version & 0xff);
+    le[1] = static_cast<uint8_t>((job.version >> 8) & 0xff);
+    le[2] = static_cast<uint8_t>((job.version >> 16) & 0xff);
+    le[3] = static_cast<uint8_t>((job.version >> 24) & 0xff);
+    d_sha256_update(&hasher, le, 4);
+    d_sha256_update(&hasher, job.merkle_root, 32);
+    le[0] = static_cast<uint8_t>(job.time & 0xff);
+    le[1] = static_cast<uint8_t>((job.time >> 8) & 0xff);
+    le[2] = static_cast<uint8_t>((job.time >> 16) & 0xff);
+    le[3] = static_cast<uint8_t>((job.time >> 24) & 0xff);
+    d_sha256_update(&hasher, le, 4);
+    le[0] = static_cast<uint8_t>(job.bits & 0xff);
+    le[1] = static_cast<uint8_t>((job.bits >> 8) & 0xff);
+    le[2] = static_cast<uint8_t>((job.bits >> 16) & 0xff);
+    le[3] = static_cast<uint8_t>((job.bits >> 24) & 0xff);
+    d_sha256_update(&hasher, le, 4);
+    for (int i = 0; i < 8; ++i) {
+        le[i] = static_cast<uint8_t>((nonce64 >> (i * 8)) & 0xff);
+    }
+    d_sha256_update(&hasher, le, 8);
+    const uint16_t dim = static_cast<uint16_t>(job.n);
+    le[0] = static_cast<uint8_t>(dim & 0xff);
+    le[1] = static_cast<uint8_t>((dim >> 8) & 0xff);
+    d_sha256_update(&hasher, le, 2);
+    d_sha256_update(&hasher, &which, 1);
+    d_sha256_final(&hasher, out_internal);
+}
+
+__device__ void d_derive_sigma(
+    const CudaJobParams& job,
+    uint64_t nonce64,
+    const uint8_t* seed_a,
+    const uint8_t* seed_b,
+    uint8_t* sigma_internal)
 {
     Sha256State h;
     d_sha256_init(&h);
@@ -364,8 +454,8 @@ __device__ void d_derive_sigma(const CudaJobParams& job, uint64_t nonce64, uint8
     d_sha256_update(&h, bi, 4);
     d_sha256_update(&h, n64, 8);
     d_sha256_update(&h, dm, 2);
-    d_sha256_update(&h, job.seed_a, 32);
-    d_sha256_update(&h, job.seed_b, 32);
+    d_sha256_update(&h, seed_a, 32);
+    d_sha256_update(&h, seed_b, 32);
 
     uint8_t first[32];
     d_sha256_final(&h, first);
@@ -374,6 +464,17 @@ __device__ void d_derive_sigma(const CudaJobParams& job, uint64_t nonce64, uint8
     d_sha256_init(&h2);
     d_sha256_update(&h2, first, 32);
     d_sha256_final(&h2, sigma_internal);
+}
+
+__device__ bool d_sigma_below_prehash(const uint8_t sigma[32], const uint8_t target_arith[32])
+{
+    for (int i = 0; i < 32; ++i) {
+        const uint8_t s = sigma[i];
+        const uint8_t t = target_arith[31 - i];
+        if (s < t) return true;
+        if (s > t) return false;
+    }
+    return true;
 }
 
 __device__ void d_fill_rect(uint32_t* out, uint32_t rows, uint32_t cols, const uint8_t* seed_internal)
@@ -535,11 +636,22 @@ __device__ bool d_solve_nonce(
     __shared__ Sha256State s_hasher;
     __shared__ bool s_hit;
     __shared__ bool s_sigma_pass;
+    __shared__ uint8_t s_seed_a[32];
+    __shared__ uint8_t s_seed_b[32];
 
     if (threadIdx.x == 0) {
-        d_derive_sigma(job, nonce64, s_sigma);
+        if (job.block_height >= btx::pow::kMatMulSeedV2Height) {
+            d_matmul_seed_v2(job, nonce64, 0, s_seed_a);
+            d_matmul_seed_v2(job, nonce64, 1, s_seed_b);
+        } else {
+            for (int i = 0; i < 32; ++i) {
+                s_seed_a[i] = job.seed_a[i];
+                s_seed_b[i] = job.seed_b[i];
+            }
+        }
+        d_derive_sigma(job, nonce64, s_seed_a, s_seed_b, s_sigma);
         s_sigma_pass = job.epsilon_bits == 0 ||
-                       d_below_target(s_sigma, job.pre_hash_target);
+                       d_sigma_below_prehash(s_sigma, job.pre_hash_target);
     }
     __syncthreads();
     if (!s_sigma_pass) {
@@ -661,10 +773,18 @@ __global__ void matmul_nonce_kernel(
     const size_t noise_elems = 2 * (static_cast<size_t>(n) * r + static_cast<size_t>(r) * n);
     const size_t scratch_elems = static_cast<size_t>(bsz) * bsz;
     const size_t compress_elems = scratch_elems;
+    const bool use_v2 = params.block_height >= btx::pow::kMatMulSeedV2Height;
+    const size_t v2_base_elems = use_v2 ? (2 * nn) : 0;
+    const size_t per_nonce_elems = v2_base_elems + nn + noise_elems + compress_elems + scratch_elems * 5;
 
     // Per-nonce workspace layout:
-    // [C nn][E_L n*r][E_R r*n][F_L n*r][F_R r*n][compress b*b][ablk][bblk][noise][prod][cblk]
-    size_t off = idx * (nn + noise_elems + compress_elems + scratch_elems * 5);
+    // [A nn][B nn] (V2 only) [C nn][E_L n*r][E_R r*n][F_L n*r][F_R r*n][compress b*b][ablk][bblk][noise][prod][cblk]
+    size_t off = idx * per_nonce_elems;
+
+    uint32_t* A_local = use_v2 ? (workspaces + off) : nullptr;
+    if (use_v2) off += nn;
+    uint32_t* B_local = use_v2 ? (workspaces + off) : nullptr;
+    if (use_v2) off += nn;
 
     uint32_t* C = workspaces + off;
     off += nn;
@@ -688,9 +808,26 @@ __global__ void matmul_nonce_kernel(
     off += scratch_elems;
     uint32_t* cblk = workspaces + off;
 
+    if (use_v2) {
+        __shared__ uint8_t s_v2_seed_a[32];
+        __shared__ uint8_t s_v2_seed_b[32];
+        if (threadIdx.x == 0) {
+            d_matmul_seed_v2(params, nonces[idx], 0, s_v2_seed_a);
+            d_matmul_seed_v2(params, nonces[idx], 1, s_v2_seed_b);
+        }
+        __syncthreads();
+        d_fill_rect(A_local, n, n, s_v2_seed_a);
+        __syncthreads();
+        d_fill_rect(B_local, n, n, s_v2_seed_b);
+        __syncthreads();
+    }
+
+    const uint32_t* use_a = use_v2 ? A_local : A;
+    const uint32_t* use_b = use_v2 ? B_local : B;
+
     uint8_t digest[32];
     const bool hit = d_solve_nonce(
-        params, A, B, nonces[idx], C, E_L, E_R, F_L, F_R, compress_v,
+        params, use_a, use_b, nonces[idx], C, E_L, E_R, F_L, F_R, compress_v,
         ablk, bblk, noise_blk, prod, cblk, digest);
 
     if (threadIdx.x == 0) {
@@ -866,6 +1003,7 @@ CudaJobParams MakeCudaJobParams(const btx::pow::MatMulJob& job, const std::vecto
     p.b = job.b;
     p.r = job.r;
     p.epsilon_bits = job.epsilon_bits;
+    p.block_height = job.block_height;
     std::memcpy(p.prev_hash, job.prev_hash.data(), 32);
     std::memcpy(p.merkle_root, job.merkle_root.data(), 32);
     std::memcpy(p.seed_a, job.seed_a.data(), 32);
@@ -884,12 +1022,13 @@ CudaJobParams MakeCudaJobParams(const btx::pow::MatMulJob& job, const std::vecto
     return p;
 }
 
-size_t WorkspaceUint32Count(uint32_t n, uint32_t r, uint32_t bsz)
+size_t WorkspaceUint32Count(uint32_t n, uint32_t r, uint32_t bsz, bool use_v2_seeds)
 {
     const size_t nn = static_cast<size_t>(n) * n;
     const size_t noise_elems = 2 * (static_cast<size_t>(n) * r + static_cast<size_t>(r) * n);
     const size_t scratch = static_cast<size_t>(bsz) * bsz;
-    return nn + noise_elems + scratch + scratch * 5;
+    const size_t v2_base = use_v2_seeds ? (2 * nn) : 0;
+    return v2_base + nn + noise_elems + scratch + scratch * 5;
 }
 
 } // namespace
@@ -919,7 +1058,8 @@ extern "C" bool LaunchMatMulTranscriptBatch(
     CudaJobParams h_params = MakeCudaJobParams(job, target);
 
     const size_t batch = nonces.size();
-    const size_t ws_uint32_per_nonce = WorkspaceUint32Count(job.n, job.r, job.b);
+    const bool use_v2 = job.block_height >= btx::pow::kMatMulSeedV2Height;
+    const size_t ws_uint32_per_nonce = WorkspaceUint32Count(job.n, job.r, job.b, use_v2);
     const size_t ws_bytes = batch * ws_uint32_per_nonce * sizeof(uint32_t);
 
     out_digests.resize(batch);

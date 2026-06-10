@@ -32,6 +32,16 @@ void LogLine(const std::string& msg)
 {
     std::cout << msg << std::endl << std::flush;
 }
+
+std::string DigestHex(const uint256& digest)
+{
+    std::ostringstream ss;
+    ss << std::hex << std::setfill('0');
+    for (int i = 31; i >= 0; --i) {
+        ss << std::setw(2) << static_cast<unsigned>(digest.data()[i]);
+    }
+    return ss.str();
+}
 } // namespace
 
 struct StratumClient::Impl {
@@ -81,7 +91,7 @@ struct StratumClient::Impl {
     bool recv_line_blocking(std::string& line);
     void send_line(const std::string& line);
     void handle_notify(const StratumJob& incoming);
-    void submit_share(const StratumJob& job, uint64_t nonce, uint32_t ntime);
+    void submit_share(const StratumJob& job, uint64_t nonce, uint32_t ntime, const uint256& digest);
     void log(const std::string& msg) const;
 };
 
@@ -199,7 +209,7 @@ void StratumClient::Impl::begin_session()
     // Reader owns the socket for the full session.
     reader_thread = std::thread(&Impl::reader_loop, this);
 
-    std::string sub = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"btx-nvidia-miner/0.2.10\",{\"protocol_compliant\":[\"pre_hash_block_tier_v18\"]}]}\n";
+    std::string sub = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"btx-nvidia-miner/0.2.11\",{\"protocol_compliant\":[\"pre_hash_block_tier_v18\"]}]}\n";
     send_line(sub);
     LogLine("[stratum] sent mining.subscribe");
 
@@ -455,7 +465,7 @@ void StratumClient::Impl::solver_loop() {
                 on_solution(snap, s.nonce, submit_ntime, verify_digest, is_block);
                 std::string saved = user;
                 user = submit_user;
-                submit_share(snap, s.nonce, submit_ntime);
+                submit_share(snap, s.nonce, submit_ntime, verify_digest);
                 user = saved;
             }
 
@@ -494,7 +504,9 @@ void StratumClient::Impl::solver_loop() {
     }
 }
 
-void StratumClient::Impl::submit_share(const StratumJob& job, uint64_t nonce, uint32_t ntime) {
+void StratumClient::Impl::submit_share(
+    const StratumJob& job, uint64_t nonce, uint32_t ntime, const uint256& digest)
+{
     std::string extranonce2(static_cast<size_t>(extranonce2_size * 2), '0');
 
     const uint64_t rpc_id = submit_id++;
@@ -509,7 +521,10 @@ void StratumClient::Impl::submit_share(const StratumJob& job, uint64_t nonce, ui
     ++shares_submitted;
     std::ostringstream slog;
     slog << "[stratum] submitted share job=" << job.job_id
-         << " nonce=0x" << std::hex << nonce << std::dec;
+         << " height=" << std::dec << job.block_height
+         << " nonce=0x" << std::hex << nonce
+         << " ntime=0x" << ntime
+         << " digest=" << DigestHex(digest);
     LogLine(slog.str());
 }
 

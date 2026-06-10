@@ -129,6 +129,56 @@ static void WriteLE32(uint8_t* p, uint32_t v)
     p[3] = static_cast<uint8_t>((v >> 24) & 0xff);
 }
 
+static void WriteLE64(uint8_t* p, uint64_t v)
+{
+    for (int i = 0; i < 8; ++i) {
+        p[i] = static_cast<uint8_t>((v >> (i * 8)) & 0xff);
+    }
+}
+
+static void WriteLE16(uint8_t* p, uint16_t v)
+{
+    p[0] = static_cast<uint8_t>(v & 0xff);
+    p[1] = static_cast<uint8_t>((v >> 8) & 0xff);
+}
+
+static void WriteCompactSize(sha256_state& hasher, uint64_t val)
+{
+    if (val < 253) {
+        const uint8_t c = static_cast<uint8_t>(val);
+        sha256_update(&hasher, &c, 1);
+    } else if (val < 0x10000) {
+        const uint8_t buf[3] = {
+            0xFD,
+            static_cast<uint8_t>(val),
+            static_cast<uint8_t>(val >> 8),
+        };
+        sha256_update(&hasher, buf, 3);
+    } else if (val < 0x100000000ULL) {
+        const uint8_t buf[5] = {
+            0xFE,
+            static_cast<uint8_t>(val),
+            static_cast<uint8_t>(val >> 8),
+            static_cast<uint8_t>(val >> 16),
+            static_cast<uint8_t>(val >> 24),
+        };
+        sha256_update(&hasher, buf, 5);
+    } else {
+        const uint8_t buf[9] = {
+            0xFF,
+            static_cast<uint8_t>(val),
+            static_cast<uint8_t>(val >> 8),
+            static_cast<uint8_t>(val >> 16),
+            static_cast<uint8_t>(val >> 24),
+            static_cast<uint8_t>(val >> 32),
+            static_cast<uint8_t>(val >> 40),
+            static_cast<uint8_t>(val >> 48),
+            static_cast<uint8_t>(val >> 56),
+        };
+        sha256_update(&hasher, buf, 9);
+    }
+}
+
 static void SetMaxArith256(uint8_t out[32])
 {
     for (int i = 0; i < 8; ++i) {
@@ -196,6 +246,58 @@ std::vector<uint8_t> PreHashTargetShift(const std::vector<uint8_t>& target, uint
     return SaturatingShiftTargetLeft(target, epsilon_bits);
 }
 
+uint256 DeterministicMatMulSeedV2(
+    const uint256& prev_hash,
+    int32_t height,
+    int32_t version,
+    const uint256& merkle_root,
+    uint32_t time,
+    uint32_t bits,
+    uint64_t nonce64,
+    uint16_t matmul_dim,
+    uint8_t which)
+{
+    sha256_state hasher;
+    sha256_init(&hasher);
+
+    static const char kTag[] = "BTX_MATMUL_SEED_V2";
+    WriteCompactSize(hasher, sizeof(kTag) - 1);
+    sha256_update(&hasher, reinterpret_cast<const uint8_t*>(kTag), sizeof(kTag) - 1);
+    sha256_update(&hasher, prev_hash.data(), 32);
+
+    uint8_t le[8];
+    WriteLE32(le, static_cast<uint32_t>(height));
+    sha256_update(&hasher, le, 4);
+    WriteLE32(le, static_cast<uint32_t>(version));
+    sha256_update(&hasher, le, 4);
+    sha256_update(&hasher, merkle_root.data(), 32);
+    WriteLE32(le, time);
+    sha256_update(&hasher, le, 4);
+    WriteLE32(le, bits);
+    sha256_update(&hasher, le, 4);
+    WriteLE64(le, nonce64);
+    sha256_update(&hasher, le, 8);
+    WriteLE16(le, matmul_dim);
+    sha256_update(&hasher, le, 2);
+    sha256_update(&hasher, &which, 1);
+
+    uint8_t digest[32];
+    sha256_final(&hasher, digest);
+    return From32(digest);
+}
+
+bool SigmaBelowPreHashTarget(const uint8_t sigma[32], const std::vector<uint8_t>& target_arith)
+{
+    if (target_arith.size() != 32) return false;
+    for (int i = 0; i < 32; ++i) {
+        const uint8_t s = sigma[i];
+        const uint8_t t = target_arith[31 - i];
+        if (s < t) return true;
+        if (s > t) return false;
+    }
+    return true;
+}
+
 bool DigestMeetsTarget(const uint256& digest, const std::vector<uint8_t>& target)
 {
     return IsBelowTarget(digest.data(), target);
@@ -204,14 +306,26 @@ bool DigestMeetsTarget(const uint256& digest, const std::vector<uint8_t>& target
 bool VerifySolution(const MatMulJob& job, uint64_t nonce, uint32_t ntime, uint256& out_digest)
 {
     const uint16_t dim = static_cast<uint16_t>(job.n);
+    const uint32_t use_time = ntime ? ntime : job.time;
+
+    uint256 seed_a = job.seed_a;
+    uint256 seed_b = job.seed_b;
+    if (job.block_height >= kMatMulSeedV2Height) {
+        seed_a = DeterministicMatMulSeedV2(
+            job.prev_hash, static_cast<int32_t>(job.block_height), job.version,
+            job.merkle_root, use_time, job.bits, nonce, dim, 0);
+        seed_b = DeterministicMatMulSeedV2(
+            job.prev_hash, static_cast<int32_t>(job.block_height), job.version,
+            job.merkle_root, use_time, job.bits, nonce, dim, 1);
+    }
 
     auto sigma_bytes = DeriveSigmaBytes(job.version, job.prev_hash, job.merkle_root,
-                                        ntime ? ntime : job.time, job.bits, nonce,
-                                        dim, job.seed_a, job.seed_b);
+                                        use_time, job.bits, nonce,
+                                        dim, seed_a, seed_b);
 
     if (job.epsilon_bits > 0 && job.block_target.size() == 32) {
         const auto pre_hash_target = PreHashTargetShift(job.block_target, job.epsilon_bits);
-        if (!IsBelowTarget(sigma_bytes.data(), pre_hash_target)) {
+        if (!SigmaBelowPreHashTarget(sigma_bytes.data(), pre_hash_target)) {
             return false;
         }
     }
@@ -219,8 +333,8 @@ bool VerifySolution(const MatMulJob& job, uint64_t nonce, uint32_t ntime, uint25
     // Build sigma uint256 for FromSeed / noise (the PRFs expect the byte layout we use in ToCanonical)
     uint256 sigma = MakeUint256(sigma_bytes);
 
-    Matrix A = FromSeed(job.seed_a, job.n);
-    Matrix B = FromSeed(job.seed_b, job.n);
+    Matrix A = FromSeed(seed_a, job.n);
+    Matrix B = FromSeed(seed_b, job.n);
 
     // Now using the cleaned noise module (DeriveNoiseSeed stores using the
     // CanonicalBytesToUint256 convention so from_oracle produces the exact
