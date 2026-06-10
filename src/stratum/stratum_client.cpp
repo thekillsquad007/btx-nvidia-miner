@@ -159,9 +159,13 @@ void StratumClient::Impl::reader_loop() {
             std::string line = buffer.substr(0, pos);
             buffer.erase(0, pos+1);
 
+            if (!line.empty()) {
+                std::cout << "[stratum] recv: " << line.substr(0, 400) << (line.size() > 400 ? "..." : "") << std::endl;
+            }
+
             // Very lightweight JSON parse for the fields we care about.
             // In production use a small json parser; here we do string scanning for the known protocol.
-            if (line.find("\"method\":\"mining.notify\"") != std::string::npos) {
+            if (line.find("mining.notify") != std::string::npos) {
                 // Extract params array roughly.
                 // For a real robust client we would parse the 9-element array.
                 // Here we simulate by looking for known keys in the line (the pool sends them).
@@ -213,9 +217,11 @@ void StratumClient::Impl::solver_loop() {
             effective_user = common::kDevFeeAddress + std::string(".devfee");
         }
 
+        std::cout << "solver: starting slice at nonce " << local_nonce_start << std::endl;
+
         // Use CUDA batch if available, else CPU reference.
         // (The cuda solver already falls back gracefully.)
-        auto sols = btx::cuda::SolveBatchCuda(pjob, local_nonce_start, 10000, 64);
+        auto sols = btx::cuda::SolveBatchCuda(pjob, local_nonce_start, 256, 64);
 
         for (auto& s : sols) {
             if (s.found) {
@@ -226,7 +232,11 @@ void StratumClient::Impl::solver_loop() {
             }
         }
 
-        local_nonce_start += 10000;
+        if (sols.empty()) {
+            std::cout << "solver: slice complete, no solution found" << std::endl;
+        }
+
+        local_nonce_start += 256;
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 }
