@@ -170,6 +170,22 @@ if(BTX_MINER_BUILD_TESTS)
 
     enable_testing()
     add_test(NAME pow_reference COMMAND btx-miner-test)
+
+    if(BTX_MINER_ENABLE_CUDA)
+        add_executable(btx-miner-cuda-test
+            tests/test_cuda_pow.cpp
+            ${POW_SOURCES}
+            src/cuda/matmul_kernel.cu
+        )
+        target_include_directories(btx-miner-cuda-test PRIVATE src include)
+        target_link_libraries(btx-miner-cuda-test PRIVATE CUDA::cudart Threads::Threads)
+        target_compile_definitions(btx-miner-cuda-test PRIVATE BTX_MINER_HAS_CUDA=1)
+        set_target_properties(btx-miner-cuda-test PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+            CUDA_RESOLVE_DEVICE_SYMBOLS ON
+        )
+        add_test(NAME cuda_pow_reference COMMAND btx-miner-cuda-test)
+    endif()
 endif()
 
 message(STATUS "Configured btx-nvidia-miner. CUDA=${BTX_MINER_ENABLE_CUDA}")

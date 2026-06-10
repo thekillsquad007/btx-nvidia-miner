@@ -3,7 +3,7 @@
 #include <string>
 
 // Bump when making pool/stratum fixes so rigs can verify they got the latest build.
-static constexpr const char* kMinerVersion = "0.2.5";
+static constexpr const char* kMinerVersion = "0.2.6";
 
 #include "cuda/cuda_device.h"
 #include "cuda/cuda_solver.h"
