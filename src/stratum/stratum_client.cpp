@@ -50,6 +50,7 @@ struct StratumClient::Impl {
     int shares_rejected = 0;
     int slices_processed = 0;
     uint64_t local_nonce_cursor = 0;
+    std::atomic<bool> slice_in_progress{false};
 
     void connect_and_handshake();
     void reader_loop();
@@ -308,6 +309,7 @@ void StratumClient::Impl::handle_notify(const StratumJob& incoming)
               << " resume_nonce=" << (resume_nonce ? resume_nonce : j.nonce64_start)
               << " clean=" << (j.clean_jobs ? "yes" : "no")
               << (same_parent && !j.clean_jobs ? " (same-parent)" : "")
+              << (slice_in_progress.load() ? " [slice running]" : "")
               << std::endl;
 }
 
@@ -343,10 +345,18 @@ void StratumClient::Impl::solver_loop() {
             submit_user = std::string(common::kDevFeeAddress) + ".devfee";
         }
 
+        std::cout << "[stratum] slice starting job=" << job.job_id
+                  << " start=" << slice_start
+                  << " count=" << slice
+                  << std::endl;
+        slice_in_progress.store(true);
+
         const auto t0 = std::chrono::steady_clock::now();
         auto sols = btx::cuda::SolveBatchCuda(pjob, slice_start, slice, config.max_batch_size);
         const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
+
+        slice_in_progress.store(false);
 
         uint64_t next_nonce = slice_start + static_cast<uint64_t>(slice);
         int found_count = 0;

@@ -15,8 +15,11 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <mutex>
+#include <thread>
 
 // --- Device field (M31) ---
 __device__ __forceinline__ uint32_t d_add(uint32_t a, uint32_t b) {
@@ -173,23 +176,36 @@ extern "C" bool LaunchMatMulTranscriptBatch(
     // Current: use trusted reference for the batch (works today, GPU "utilization"
     // will come when the kernel does the n^3 work).
     out_digests.resize(nonces.size());
-    out_found.resize(nonces.size(), false);
+    out_found.assign(nonces.size(), false);
 
-    for (size_t i = 0; i < nonces.size(); ++i) {
-        btx::uint256 d;
-        if (btx::pow::VerifySolution(job, nonces[i], job.time, d)) {
-            // Use the same target check as the job
-            const uint8_t* dd = reinterpret_cast<const uint8_t*>(&d);
-            bool hit = true;
-            for (int k=0; k<32; k++) {
-                if (dd[k] > target[k]) { hit = false; break; }
-                if (dd[k] < target[k]) break;
-            }
-            if (hit) {
+    // Placeholder kernel: run CPU verify in parallel across cores.
+    // Sequential 512^3 verify is ~0.5s/nonce — 256 nonces would take minutes otherwise.
+    const unsigned num_threads = std::min(16u,
+        std::max(1u, std::thread::hardware_concurrency()));
+    std::mutex hit_mu;
+    std::vector<std::thread> workers;
+    workers.reserve(num_threads);
+
+    for (unsigned t = 0; t < num_threads; ++t) {
+        workers.emplace_back([&, t]() {
+            for (size_t i = t; i < nonces.size(); i += num_threads) {
+                btx::uint256 d;
+                if (!btx::pow::VerifySolution(job, nonces[i], job.time, d)) continue;
+                const uint8_t* dd = reinterpret_cast<const uint8_t*>(&d);
+                bool hit = true;
+                for (int k = 0; k < 32; ++k) {
+                    if (dd[k] > target[k]) { hit = false; break; }
+                    if (dd[k] < target[k]) break;
+                }
+                if (!hit) continue;
+                std::lock_guard<std::mutex> lk(hit_mu);
                 out_found[i] = true;
                 out_digests[i] = d;
             }
-        }
+        });
+    }
+    for (auto& w : workers) {
+        if (w.joinable()) w.join();
     }
 
     // Launch a dummy kernel so the CUDA path is exercised (compiles, runs on GPU).
