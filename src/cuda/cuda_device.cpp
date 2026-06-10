@@ -78,5 +78,23 @@ void WarmupDevices(const std::vector<int>& device_ids)
 #endif
 }
 
+size_t GetDeviceFreeMemBytes(int device)
+{
+#ifdef BTX_MINER_HAS_CUDA
+    if (cudaSetDevice(device) != cudaSuccess) {
+        return 0;
+    }
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+        return 0;
+    }
+    return free_bytes;
+#else
+    (void)device;
+    return 0;
+#endif
+}
+
 } // namespace cuda
 } // namespace btx

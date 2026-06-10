@@ -523,9 +523,10 @@ void StratumClient::Impl::solver_loop() {
             slice_start = local_nonce_cursor ? local_nonce_cursor : job.nonce64_start;
         }
 
+        // Outer nonce chunk per SolveBatchCuda call; 0 max_batch_size = auto inside CUDA.
         const int chunk = config.job_chunk_size > 0
             ? config.job_chunk_size
-            : config.max_batch_size;
+            : (config.max_batch_size > 0 ? config.max_batch_size : 65536);
         const uint64_t slice_cap = static_cast<uint64_t>(
             std::max(config.nonces_per_slice, chunk));
         const auto slice_deadline = std::chrono::steady_clock::now() +
@@ -538,9 +539,12 @@ void StratumClient::Impl::solver_loop() {
         }
 
         if (config.verbose || slices_processed % 20 == 0) {
+            const std::string batch_label = config.max_batch_size > 0
+                ? std::to_string(config.max_batch_size)
+                : "auto";
             LogLine("[stratum] slice starting job=" + job.job_id +
                     " start=" + std::to_string(slice_start) +
-                    " batch=" + std::to_string(config.max_batch_size) +
+                    " batch=" + batch_label +
                     " max_sec=" + std::to_string(config.slice_max_seconds));
         }
         slice_in_progress.store(true);

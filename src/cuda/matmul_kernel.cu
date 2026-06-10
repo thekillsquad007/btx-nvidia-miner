@@ -678,6 +678,8 @@ __device__ bool d_solve_nonce(
     uint32_t* noise_blk,
     uint32_t* prod,
     uint32_t* cblk,
+    const uint8_t* reuse_seed_a,
+    const uint8_t* reuse_seed_b,
     uint8_t* digest_out)
 {
     __shared__ uint8_t s_sigma[32];
@@ -691,7 +693,12 @@ __device__ bool d_solve_nonce(
     __shared__ uint8_t s_seed_b[32];
 
     if (threadIdx.x == 0) {
-        if (job.block_height >= btx::pow::kMatMulSeedV2Height) {
+        if (reuse_seed_a && reuse_seed_b) {
+            for (int i = 0; i < 32; ++i) {
+                s_seed_a[i] = reuse_seed_a[i];
+                s_seed_b[i] = reuse_seed_b[i];
+            }
+        } else if (job.block_height >= btx::pow::kMatMulSeedV2Height) {
             d_matmul_seed_v2(job, nonce64, 0, s_seed_a);
             d_matmul_seed_v2(job, nonce64, 1, s_seed_b);
         } else {
@@ -839,9 +846,10 @@ __global__ void matmul_nonce_kernel(
     off += scratch_elems;
     uint32_t* cblk = workspaces + off;
 
+    __shared__ uint8_t s_v2_seed_a[32];
+    __shared__ uint8_t s_v2_seed_b[32];
+
     if (use_v2) {
-        __shared__ uint8_t s_v2_seed_a[32];
-        __shared__ uint8_t s_v2_seed_b[32];
         if (threadIdx.x == 0) {
             d_matmul_seed_v2(params, nonces[idx], 0, s_v2_seed_a);
             d_matmul_seed_v2(params, nonces[idx], 1, s_v2_seed_b);
@@ -857,16 +865,18 @@ __global__ void matmul_nonce_kernel(
     const uint32_t* use_b = use_v2 ? B_local : B;
 
     uint8_t digest[32];
+    const uint8_t* reuse_a = use_v2 ? s_v2_seed_a : nullptr;
+    const uint8_t* reuse_b = use_v2 ? s_v2_seed_b : nullptr;
     const bool hit = d_solve_nonce(
         params, use_a, use_b, nonces[idx], C, E_L, E_R, F_L, F_R, compress_v,
-        ablk, bblk, noise_blk, prod, cblk, digest);
+        ablk, bblk, noise_blk, prod, cblk, reuse_a, reuse_b, digest);
 
     if (threadIdx.x == 0) {
         if (hit) {
             out_found[idx] = 1;
-        }
-        for (int i = 0; i < 32; ++i) {
-            out_digests[idx * 32 + i] = digest[i];
+            for (int i = 0; i < 32; ++i) {
+                out_digests[idx * 32 + i] = digest[i];
+            }
         }
     }
 }
@@ -967,6 +977,13 @@ bool EnsureMatricesOnDevice(
 {
     if (device < 0 || device >= 16) {
         return false;
+    }
+
+    // Post-fork jobs derive per-nonce A/B on device; skip CPU FromSeed + H2D.
+    if (job.block_height >= btx::pow::kMatMulSeedV2Height) {
+        *d_A = nullptr;
+        *d_B = nullptr;
+        return true;
     }
 
     DeviceMatrixCache& cache = g_matrix_cache[device];
@@ -1123,13 +1140,25 @@ extern "C" bool LaunchMatMulTranscriptBatch(
     if (cudaMemcpy(h_found.data(), pool.d_found, batch, cudaMemcpyDeviceToHost) != cudaSuccess) {
         return false;
     }
-    if (cudaMemcpy(h_digests.data(), pool.d_digests, batch * 32, cudaMemcpyDeviceToHost) != cudaSuccess) {
-        return false;
+
+    bool any_hit = false;
+    for (size_t i = 0; i < batch; ++i) {
+        out_found[i] = h_found[i] != 0;
+        if (out_found[i]) {
+            any_hit = true;
+        }
     }
 
-    for (size_t i = 0; i < batch; ++i) {
-        std::memcpy(out_digests[i].data(), h_digests.data() + i * 32, 32);
-        out_found[i] = h_found[i] != 0;
+    if (any_hit) {
+        if (cudaMemcpy(h_digests.data(), pool.d_digests, batch * 32, cudaMemcpyDeviceToHost) !=
+            cudaSuccess) {
+            return false;
+        }
+        for (size_t i = 0; i < batch; ++i) {
+            if (out_found[i]) {
+                std::memcpy(out_digests[i].data(), h_digests.data() + i * 32, 32);
+            }
+        }
     }
     return true;
 }

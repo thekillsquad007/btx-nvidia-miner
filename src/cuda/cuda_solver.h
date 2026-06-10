@@ -16,15 +16,19 @@ struct CudaSolution {
     uint256 digest;  // the matmul_digest
 };
 
+// Per-nonce GPU workspace bytes (for auto batch sizing).
+size_t WorkspaceBytesPerNonce(const pow::MatMulJob& job);
+
+// Pick a launch batch from free VRAM. Returns at least 64, at most max_cap.
+int AutoBatchSizeForDevice(int device, const pow::MatMulJob& job, int max_cap = 2048);
+
 // Run a search for solutions on available CUDA devices.
-// Uses the CPU reference for prep (noise etc for correctness) and for final cross-check.
-// Splits work across devices for multi-GPU.
-// Returns any solutions found in the [start_nonce, start_nonce + max_tries) range.
+// max_batch_size <= 0 selects AutoBatchSizeForDevice per GPU.
 std::vector<CudaSolution> SolveBatchCuda(
     const pow::MatMulJob& job,
     uint64_t start_nonce,
     uint64_t max_tries,
-    int max_batch_size = 256  // tune per GPU mem
+    int max_batch_size = 0
 );
 
 // Usable GPU indices: see cuda_device.h GetUsableDeviceIndices().

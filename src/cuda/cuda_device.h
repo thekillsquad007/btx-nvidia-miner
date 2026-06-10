@@ -21,5 +21,8 @@ std::vector<int> GetUsableDeviceIndices();
 void WarmupDevices(const std::vector<int>& device_ids);
 bool HasCudaSupport();
 
+// Free VRAM on device after cudaSetDevice(device).
+size_t GetDeviceFreeMemBytes(int device);
+
 } // namespace cuda
 } // namespace btx

@@ -27,7 +27,7 @@ Common:
   --pass <password>         Pool password (default: x)
   --devices 0,1,2|all       GPUs to use (default: all visible)
   --intensity <n>           Max nonces per slice safety cap (default: 20000000)
-  --batch <n>               CUDA nonces per kernel launch (default: 256)
+  --batch <n>               CUDA nonces per kernel launch (0 = auto from VRAM, default)
   --slice-seconds <n>       Time-limit each mining slice in seconds (default: 5)
   --verbose                 Extra stratum debug logging
   --benchmark               Run a short throughput test (CPU ref + CUDA if available)
@@ -98,7 +98,7 @@ int main(int argc, char** argv)
     bool force_cpu = false;
     bool verbose = false;
     int intensity = 20'000'000;
-    int batch = 256;
+    int batch = 0;
     double slice_seconds = 5.0;
     float dev_fee_override = -1.0f;
     std::string devices_spec = "all";
@@ -196,7 +196,7 @@ int main(int argc, char** argv)
                       << "use --batch for CUDA launch size." << std::endl;
         }
         std::cout << "Slice=" << slice_seconds << "s cap=" << intensity
-                  << " nonces, batch=" << batch;
+                  << " nonces, batch=" << (batch > 0 ? std::to_string(batch) : "auto");
         if (devices_spec != "all") std::cout << ", devices=" << devices_spec;
         std::cout << std::endl;
         print_gpu_inventory();
@@ -209,6 +209,20 @@ int main(int argc, char** argv)
             }
             std::cout << std::endl;
             btx::cuda::WarmupDevices(active);
+#ifdef BTX_MINER_HAS_CUDA
+            if (batch <= 0) {
+                btx::pow::MatMulJob sample;
+                sample.n = 512;
+                sample.b = 16;
+                sample.r = 8;
+                sample.block_height = btx::pow::kMatMulSeedV2Height;
+                for (int id : active) {
+                    std::cout << "GPU " << id << " auto batch="
+                              << btx::cuda::AutoBatchSizeForDevice(id, sample)
+                              << " (from free VRAM)" << std::endl;
+                }
+            }
+#endif
         }
 
         auto on_sol = [](const btx::stratum::StratumJob& j, uint64_t nonce, uint32_t ntime, const uint256& /*dig*/, bool is_block) {
@@ -219,7 +233,7 @@ int main(int argc, char** argv)
 
         btx::stratum::StratumConfig cfg;
         cfg.nonces_per_slice = intensity > 0 ? intensity : 20'000'000;
-        cfg.max_batch_size = batch > 0 ? batch : 256;
+        cfg.max_batch_size = batch;
         cfg.slice_max_seconds = slice_seconds > 0.0 ? slice_seconds : 5.0;
         cfg.verbose = verbose;
 

@@ -17,6 +17,42 @@
 namespace btx {
 namespace cuda {
 
+size_t WorkspaceBytesPerNonce(const pow::MatMulJob& job)
+{
+    const uint32_t n = job.n;
+    const uint32_t r = job.r;
+    const uint32_t bsz = job.b;
+    const size_t nn = static_cast<size_t>(n) * n;
+    const size_t noise_elems = 2 * (static_cast<size_t>(n) * r + static_cast<size_t>(r) * n);
+    const size_t scratch = static_cast<size_t>(bsz) * bsz;
+    const bool use_v2 = job.block_height >= pow::kMatMulSeedV2Height;
+    const size_t v2_base = use_v2 ? (2 * nn) : 0;
+    const size_t per_nonce_elems = v2_base + nn + noise_elems + scratch + scratch * 5;
+    return per_nonce_elems * sizeof(uint32_t);
+}
+
+int AutoBatchSizeForDevice(int device, const pow::MatMulJob& job, int max_cap)
+{
+    const size_t per_nonce = WorkspaceBytesPerNonce(job);
+    if (per_nonce == 0) {
+        return 256;
+    }
+
+    constexpr size_t kReserveBytes = 256 * 1024 * 1024;
+    const size_t free_bytes = GetDeviceFreeMemBytes(device);
+    if (free_bytes <= kReserveBytes) {
+        return 256;
+    }
+
+    const size_t usable = static_cast<size_t>((free_bytes - kReserveBytes) * 0.85);
+    int batch = static_cast<int>(usable / per_nonce);
+    batch = std::max(64, batch);
+    if (max_cap > 0) {
+        batch = std::min(batch, max_cap);
+    }
+    return batch;
+}
+
 namespace {
 
 #ifdef BTX_MINER_HAS_CUDA
@@ -62,12 +98,16 @@ std::vector<CudaSolution> SolveOnDevice(
     std::vector<CudaSolution> solutions;
     if (count == 0) return solutions;
 
+    const int launch_batch = max_batch_size > 0
+        ? max_batch_size
+        : AutoBatchSizeForDevice(dev, job);
+
     const auto t0 = std::chrono::steady_clock::now();
     uint64_t current_nonce = start_nonce;
     uint64_t remaining = count;
 
     while (remaining > 0) {
-        int batch = static_cast<int>(std::min<uint64_t>(remaining, max_batch_size));
+        int batch = static_cast<int>(std::min<uint64_t>(remaining, static_cast<uint64_t>(launch_batch)));
         std::vector<uint64_t> batch_nonces;
         batch_nonces.reserve(batch);
         for (int i = 0; i < batch; ++i) {
