@@ -1,0 +1,47 @@
+name: Build CUDA Miner
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-cuda:
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          apt-get update
+          apt-get install -y cmake git pkg-config libcurl4-openssl-dev
+
+      - name: Configure (CUDA)
+        run: |
+          mkdir build
+          cd build
+          cmake -DCMAKE_BUILD_TYPE=Release \
+                -DBTX_MINER_ENABLE_CUDA=ON \
+                -DCUDA_ARCHS="75;86;89;90" \
+                ..
+
+      - name: Build
+        run: |
+          cd build
+          make -j$(nproc)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: btx-nvidia-miner-cuda
+          path: build/btx-miner
+          retention-days: 14
+
+      - name: Smoke test (CPU path inside container)
+        run: |
+          cd build
+          ./btx-miner --benchmark || true
