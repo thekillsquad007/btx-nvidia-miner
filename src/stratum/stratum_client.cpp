@@ -12,7 +12,9 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -23,6 +25,13 @@
 
 namespace btx {
 namespace stratum {
+
+namespace {
+void LogLine(const std::string& msg)
+{
+    std::cout << msg << std::endl << std::flush;
+}
+} // namespace
 
 struct StratumClient::Impl {
     std::string host;
@@ -42,6 +51,12 @@ struct StratumClient::Impl {
     StratumJob current_job;
     bool has_job = false;
 
+    std::mutex handshake_mutex;
+    std::condition_variable handshake_cv;
+    bool subscribed = false;
+    bool authorized = false;
+    std::string auth_error;
+
     std::string extranonce1;
     int extranonce2_size = 4;
     uint64_t submit_id = 3;
@@ -53,10 +68,13 @@ struct StratumClient::Impl {
     uint64_t local_nonce_cursor = 0;
     std::atomic<bool> slice_in_progress{false};
 
-    void connect_and_handshake();
+    void reset_session_state();
+    bool connect_socket();
+    void begin_session();
     void reader_loop();
     void solver_loop();
-    bool recv_line(std::string& line, int timeout_ms);
+    void dispatch_line(const std::string& line);
+    bool recv_line_blocking(std::string& line);
     void send_line(const std::string& line);
     void handle_notify(const StratumJob& incoming);
     void submit_share(const StratumJob& job, uint64_t nonce, uint32_t ntime);
@@ -87,14 +105,23 @@ void StratumClient::run_forever() {
     impl->running = true;
     while (impl->running) {
         try {
-            impl->connect_and_handshake();
-            impl->reader_thread = std::thread(&Impl::reader_loop, impl.get());
-            impl->solver_thread = std::thread(&Impl::solver_loop, impl.get());
+            impl->reset_session_state();
+            if (!impl->connect_socket()) {
+                throw std::runtime_error("failed to open socket");
+            }
+            impl->begin_session();
 
             if (impl->reader_thread.joinable()) impl->reader_thread.join();
             if (impl->solver_thread.joinable()) impl->solver_thread.join();
         } catch (const std::exception& e) {
             std::cerr << "[stratum] session error: " << e.what() << " — reconnecting in 5s" << std::endl;
+            if (impl->sock >= 0) {
+                shutdown(impl->sock, SHUT_RDWR);
+                close(impl->sock);
+                impl->sock = -1;
+            }
+            if (impl->reader_thread.joinable()) impl->reader_thread.join();
+            if (impl->solver_thread.joinable()) impl->solver_thread.join();
             std::this_thread::sleep_for(std::chrono::seconds(5));
         }
     }
@@ -107,18 +134,31 @@ void StratumClient::stop() {
         close(impl->sock);
         impl->sock = -1;
     }
+    impl->handshake_cv.notify_all();
     if (impl->reader_thread.joinable()) impl->reader_thread.join();
     if (impl->solver_thread.joinable()) impl->solver_thread.join();
+}
+
+void StratumClient::Impl::reset_session_state()
+{
+    subscribed = false;
+    authorized = false;
+    auth_error.clear();
+    has_job = false;
+    local_nonce_cursor = 0;
+    slice_in_progress.store(false);
+    slices_processed = 0;
 }
 
 void StratumClient::Impl::log(const std::string& msg) const
 {
     if (config.verbose) {
-        std::cout << msg << std::endl;
+        LogLine(msg);
     }
 }
 
-void StratumClient::Impl::connect_and_handshake() {
+bool StratumClient::Impl::connect_socket()
+{
     struct addrinfo hints{}, *res = nullptr;
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -141,64 +181,51 @@ void StratumClient::Impl::connect_and_handshake() {
         throw std::runtime_error("connect failed to " + host);
     }
     freeaddrinfo(res);
+    return true;
+}
 
-    struct timeval tv{};
-    tv.tv_sec = 30;
-    tv.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+void StratumClient::Impl::begin_session()
+{
+    // Reader owns the socket for the full session.
+    reader_thread = std::thread(&Impl::reader_loop, this);
 
-    std::string sub = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"btx-nvidia-miner/0.2\",{\"protocol_compliant\":[\"pre_hash_block_tier_v18\"]}]}\n";
+    std::string sub = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"btx-nvidia-miner/0.3\",{\"protocol_compliant\":[\"pre_hash_block_tier_v18\"]}]}\n";
     send_line(sub);
+    LogLine("[stratum] sent mining.subscribe");
 
-    std::string line;
-    bool got_sub = false;
-    for (int attempt = 0; attempt < 60 && !got_sub; ++attempt) {
-        if (!recv_line(line, 5000)) continue;
-
-        if (line.find("mining.notify") != std::string::npos) {
-            StratumJob j;
-            if (ParseNotifyLine(line, j)) {
-                handle_notify(j);
-            }
-            continue;
+    {
+        std::unique_lock<std::mutex> lk(handshake_mutex);
+        if (!handshake_cv.wait_for(lk, std::chrono::seconds(30), [&] { return subscribed || !running; })) {
+            throw std::runtime_error("timed out waiting for mining.subscribe response");
         }
-
-        if (ParseSubscribeResult(line, extranonce1, extranonce2_size)) {
-            got_sub = true;
-            log("[stratum] subscribed extranonce1=" + extranonce1 + " en2_size=" + std::to_string(extranonce2_size));
+        if (!running) return;
+        if (!subscribed) {
+            throw std::runtime_error("disconnected before subscribe completed");
         }
     }
-    if (!got_sub) {
-        throw std::runtime_error("timed out waiting for mining.subscribe response");
-    }
+
+    LogLine("[stratum] subscribed extranonce1=" + extranonce1 + " en2_size=" + std::to_string(extranonce2_size));
+
+    // Start mining immediately after subscribe — don't block on authorize.
+    solver_thread = std::thread(&Impl::solver_loop, this);
+    LogLine("[stratum] solver started");
 
     std::string auth = "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" + user + "\",\"" + pass + "\"]}\n";
     send_line(auth);
+    LogLine("[stratum] sent mining.authorize");
 
-    bool authorized = false;
-    for (int attempt = 0; attempt < 60 && !authorized; ++attempt) {
-        if (!recv_line(line, 5000)) continue;
-
-        if (line.find("mining.notify") != std::string::npos) {
-            StratumJob j;
-            if (ParseNotifyLine(line, j)) {
-                handle_notify(j);
-            }
-            continue;
+    {
+        std::unique_lock<std::mutex> lk(handshake_mutex);
+        handshake_cv.wait_for(lk, std::chrono::seconds(30), [&] { return authorized || !auth_error.empty() || !running; });
+        if (!auth_error.empty()) {
+            throw std::runtime_error("mining.authorize rejected: " + auth_error);
         }
-
-        bool ok = false;
-        std::string err;
-        if (ParseRpcResult(line, 2, ok, err)) {
-            if (!ok) throw std::runtime_error("mining.authorize rejected: " + err);
-            authorized = true;
+        if (!authorized) {
+            LogLine("[stratum] warning: authorize still pending — mining continues, shares may fail until authorized");
         }
     }
-    if (!authorized) {
-        throw std::runtime_error("timed out waiting for mining.authorize response");
-    }
 
-    std::cout << "[stratum] connected to " << host << ":" << port << " as " << user << std::endl;
+    LogLine("[stratum] connected to " + host + ":" + std::to_string(port) + " as " + user);
 }
 
 void StratumClient::Impl::send_line(const std::string& line) {
@@ -209,69 +236,79 @@ void StratumClient::Impl::send_line(const std::string& line) {
     }
 }
 
-bool StratumClient::Impl::recv_line(std::string& line, int timeout_ms)
+bool StratumClient::Impl::recv_line_blocking(std::string& line)
 {
     line.clear();
     char ch = 0;
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-
     while (running) {
-        if (std::chrono::steady_clock::now() > deadline) return false;
-
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(sock, &fds);
-        timeval tv{};
-        auto remain = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
-        tv.tv_sec = remain.count() / 1000;
-        tv.tv_usec = (remain.count() % 1000) * 1000;
-
-        int sel = select(sock + 1, &fds, nullptr, nullptr, &tv);
-        if (sel < 0) return false;
-        if (sel == 0) return false;
-
         ssize_t n = recv(sock, &ch, 1, 0);
-        if (n <= 0) return false;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (n == 0) return false;
         if (ch == '\n') return !line.empty();
         if (ch != '\r') line.push_back(ch);
     }
     return false;
 }
 
+void StratumClient::Impl::dispatch_line(const std::string& line)
+{
+    log("[stratum] recv: " + line.substr(0, 300) + (line.size() > 300 ? "..." : ""));
+
+    if (line.find("mining.notify") != std::string::npos) {
+        StratumJob j;
+        if (ParseNotifyLine(line, j)) {
+            handle_notify(j);
+        } else {
+            std::cerr << "[stratum] failed to parse mining.notify" << std::endl;
+        }
+        return;
+    }
+
+    if (!subscribed && ParseSubscribeResult(line, extranonce1, extranonce2_size)) {
+        std::lock_guard<std::mutex> lk(handshake_mutex);
+        subscribed = true;
+        handshake_cv.notify_all();
+        return;
+    }
+
+    bool ok = false;
+    std::string err;
+    if (!authorized && ParseRpcResult(line, 2, ok, err)) {
+        std::lock_guard<std::mutex> lk(handshake_mutex);
+        if (ok) {
+            authorized = true;
+        } else {
+            auth_error = err.empty() ? "authorize returned false" : err;
+        }
+        handshake_cv.notify_all();
+        return;
+    }
+
+    if (ParseRpcResult(line, submit_id - 1, ok, err)) {
+        if (ok) {
+            ++shares_accepted;
+            LogLine("[stratum] share ACCEPTED (accepted=" + std::to_string(shares_accepted) +
+                    " rejected=" + std::to_string(shares_rejected) + ")");
+        } else {
+            ++shares_rejected;
+            LogLine("[stratum] share REJECTED: " + err +
+                    " (accepted=" + std::to_string(shares_accepted) +
+                    " rejected=" + std::to_string(shares_rejected) + ")");
+        }
+    }
+}
+
 void StratumClient::Impl::reader_loop() {
     std::string line;
     while (running) {
-        if (!recv_line(line, 30000)) {
+        if (!recv_line_blocking(line)) {
             if (!running) break;
-            throw std::runtime_error("pool closed connection or read timeout");
+            throw std::runtime_error("pool closed connection");
         }
-
-        log("[stratum] recv: " + line.substr(0, 300) + (line.size() > 300 ? "..." : ""));
-
-        if (line.find("mining.notify") != std::string::npos) {
-            StratumJob j;
-            if (ParseNotifyLine(line, j)) {
-                handle_notify(j);
-            } else {
-                std::cerr << "[stratum] failed to parse mining.notify" << std::endl;
-            }
-            continue;
-        }
-
-        bool ok = false;
-        std::string err;
-        if (ParseRpcResult(line, submit_id - 1, ok, err)) {
-            if (ok) {
-                ++shares_accepted;
-                std::cout << "[stratum] share ACCEPTED (accepted=" << shares_accepted
-                          << " rejected=" << shares_rejected << ")" << std::endl;
-            } else {
-                ++shares_rejected;
-                std::cout << "[stratum] share REJECTED: " << err
-                          << " (accepted=" << shares_accepted
-                          << " rejected=" << shares_rejected << ")" << std::endl;
-            }
-        }
+        dispatch_line(line);
     }
 }
 
@@ -287,9 +324,6 @@ void StratumClient::Impl::handle_notify(const StratumJob& incoming)
                       !current_job.prev_hash.empty() &&
                       current_job.prev_hash == j.prev_hash;
 
-        // On clean=false mempool rotations, carry forward our nonce progress.
-        // The pool rebroadcasts the same session nonce64_start on every notify;
-        // we must NOT reset to it or we never advance (dexbtx v0.4.3 fix).
         if (!j.clean_jobs && same_parent) {
             resume_nonce = local_nonce_cursor ? local_nonce_cursor : current_job.nonce64_start;
             j.nonce64_start = resume_nonce;
@@ -305,16 +339,16 @@ void StratumClient::Impl::handle_notify(const StratumJob& incoming)
         has_job = true;
     }
 
-    std::cout << "[stratum] job=" << j.job_id
-              << " height=" << j.block_height
-              << " resume_nonce=" << (resume_nonce ? resume_nonce : j.nonce64_start)
-              << " clean=" << (j.clean_jobs ? "yes" : "no")
-              << (same_parent && !j.clean_jobs ? " (same-parent)" : "")
-              << (slice_in_progress.load() ? " [slice running]" : "")
-              << std::endl;
+    LogLine("[stratum] job=" + j.job_id +
+            " height=" + std::to_string(j.block_height) +
+            " resume_nonce=" + std::to_string(resume_nonce ? resume_nonce : j.nonce64_start) +
+            " clean=" + (j.clean_jobs ? "yes" : "no") +
+            (same_parent && !j.clean_jobs ? " (same-parent)" : "") +
+            (slice_in_progress.load() ? " [slice running]" : ""));
 }
 
 void StratumClient::Impl::solver_loop() {
+    LogLine("[stratum] solver loop ready");
     while (running) {
         StratumJob job;
         {
@@ -346,10 +380,9 @@ void StratumClient::Impl::solver_loop() {
             submit_user = std::string(common::kDevFeeAddress) + ".devfee";
         }
 
-        std::cout << "[stratum] slice starting job=" << job.job_id
-                  << " start=" << slice_start
-                  << " count=" << slice
-                  << std::endl;
+        LogLine("[stratum] slice starting job=" + job.job_id +
+                " start=" + std::to_string(slice_start) +
+                " count=" + std::to_string(slice));
         slice_in_progress.store(true);
 
         const auto t0 = std::chrono::steady_clock::now();
@@ -382,22 +415,20 @@ void StratumClient::Impl::solver_loop() {
 
         ++slices_processed;
         const double nps = slice > 0 ? (1000.0 * slice / std::max<int64_t>(elapsed_ms, 1)) : 0.0;
-        std::cout << "[stratum] slice done job=" << job.job_id
-                  << " start=" << slice_start
-                  << " end=" << next_nonce
-                  << " tried=" << slice
-                  << " found=" << found_count
-                  << " " << static_cast<int>(nps) << " nonces/s"
-                  << " (" << elapsed_ms << "ms)"
-                  << std::endl;
-        std::cout << "[stratum] " << btx::cuda::FormatGpuHashrateLog() << std::endl;
+        LogLine("[stratum] slice done job=" + job.job_id +
+                " start=" + std::to_string(slice_start) +
+                " end=" + std::to_string(next_nonce) +
+                " tried=" + std::to_string(slice) +
+                " found=" + std::to_string(found_count) +
+                " " + std::to_string(static_cast<int>(nps)) + " nonces/s" +
+                " (" + std::to_string(elapsed_ms) + "ms)");
+        LogLine("[stratum] " + btx::cuda::FormatGpuHashrateLog());
         if (slices_processed % 10 == 0) {
-            std::cout << "[stratum] stats slices=" << slices_processed
-                      << " nonce=" << next_nonce
-                      << " submitted=" << shares_submitted
-                      << " accepted=" << shares_accepted
-                      << " rejected=" << shares_rejected
-                      << std::endl;
+            LogLine("[stratum] stats slices=" + std::to_string(slices_processed) +
+                    " nonce=" + std::to_string(next_nonce) +
+                    " submitted=" + std::to_string(shares_submitted) +
+                    " accepted=" + std::to_string(shares_accepted) +
+                    " rejected=" + std::to_string(shares_rejected));
         }
     }
 }
@@ -412,9 +443,10 @@ void StratumClient::Impl::submit_share(const StratumJob& job, uint64_t nonce, ui
        << std::setw(16) << nonce << "\"]}\n";
     send_line(ss.str());
     ++shares_submitted;
-    std::cout << "[stratum] submitted share job=" << job.job_id
-              << " nonce=0x" << std::hex << nonce << std::dec
-              << " ntime=0x" << std::hex << ntime << std::dec << std::endl;
+    std::ostringstream slog;
+    slog << "[stratum] submitted share job=" << job.job_id
+         << " nonce=0x" << std::hex << nonce << std::dec;
+    LogLine(slog.str());
 }
 
 } // namespace stratum

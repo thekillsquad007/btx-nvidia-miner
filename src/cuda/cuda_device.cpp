@@ -65,5 +65,18 @@ std::vector<int> GetUsableDeviceIndices()
     return ids;
 }
 
+void WarmupDevices(const std::vector<int>& device_ids)
+{
+#ifdef BTX_MINER_HAS_CUDA
+    for (int id : device_ids) {
+        if (cudaSetDevice(id) == cudaSuccess) {
+            cudaFree(0);
+        }
+    }
+#else
+    (void)device_ids;
+#endif
+}
+
 } // namespace cuda
 } // namespace btx

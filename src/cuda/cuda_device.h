@@ -18,6 +18,7 @@ struct CudaDeviceInfo {
 
 std::vector<CudaDeviceInfo> EnumerateDevices();
 std::vector<int> GetUsableDeviceIndices();
+void WarmupDevices(const std::vector<int>& device_ids);
 bool HasCudaSupport();
 
 } // namespace cuda

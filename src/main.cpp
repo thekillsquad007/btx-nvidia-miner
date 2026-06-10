@@ -3,7 +3,7 @@
 #include <string>
 
 // Bump when making pool/stratum fixes so rigs can verify they got the latest build.
-static constexpr const char* kMinerVersion = "0.2.2";
+static constexpr const char* kMinerVersion = "0.2.3";
 
 #include "cuda/cuda_device.h"
 #include "cuda/cuda_solver.h"
@@ -199,6 +199,7 @@ int main(int argc, char** argv)
                 std::cout << " " << active[i];
             }
             std::cout << std::endl;
+            btx::cuda::WarmupDevices(active);
         }
 
         auto on_sol = [](const btx::stratum::StratumJob& j, uint64_t nonce, uint32_t ntime, const uint256& /*dig*/, bool is_block) {

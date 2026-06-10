@@ -419,18 +419,26 @@ bool ParseRpcResult(const std::string& line, uint64_t id, bool& ok, std::string&
     ok = false;
     error.clear();
 
-    if (line.find("\"error\":null") != std::string::npos ||
-        line.find("\"error\": null") != std::string::npos) {
-        if (line.find("\"result\":true") != std::string::npos ||
-            line.find("\"result\": true") != std::string::npos) {
-            ok = true;
-            return true;
-        }
-        if (line.find("\"result\":false") != std::string::npos ||
-            line.find("\"result\": false") != std::string::npos) {
-            ok = false;
-            return true;
-        }
+    const bool err_null = (line.find("\"error\":null") != std::string::npos ||
+                           line.find("\"error\": null") != std::string::npos);
+    const bool result_true = (line.find("\"result\":true") != std::string::npos ||
+                              line.find("\"result\": true") != std::string::npos ||
+                              line.find("\"result\":True") != std::string::npos);
+    const bool result_false = (line.find("\"result\":false") != std::string::npos ||
+                               line.find("\"result\": false") != std::string::npos ||
+                               line.find("\"result\":False") != std::string::npos);
+
+    if (err_null && result_true) {
+        ok = true;
+        return true;
+    }
+    if (result_false) {
+        ok = false;
+        return true;
+    }
+    if (err_null && result_false) {
+        ok = false;
+        return true;
     }
 
     size_t err_pos = line.find("\"error\":");
