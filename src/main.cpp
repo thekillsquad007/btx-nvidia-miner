@@ -3,9 +3,11 @@
 #include <string>
 
 // Bump when making pool/stratum fixes so rigs can verify they got the latest build.
-static constexpr const char* kMinerVersion = "0.2.1";
+static constexpr const char* kMinerVersion = "0.2.2";
 
+#include "cuda/cuda_device.h"
 #include "cuda/cuda_solver.h"
+#include "cuda/hashrate.h"
 #include "pow/matmul_pow.h"
 #include "stratum/stratum_client.h"
 #include "stratum/stratum_protocol.h"
@@ -44,6 +46,40 @@ See README.md for full tuning and multi-GPU details.
 )";
 }
 
+static std::vector<int> parse_devices(const std::string& spec)
+{
+    std::vector<int> out;
+    if (spec.empty() || spec == "all") return out;
+    size_t pos = 0;
+    while (pos < spec.size()) {
+        size_t comma = spec.find(',', pos);
+        std::string part = spec.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        if (!part.empty()) out.push_back(std::atoi(part.c_str()));
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    return out;
+}
+
+static void print_gpu_inventory()
+{
+#ifdef BTX_MINER_HAS_CUDA
+    auto devs = btx::cuda::EnumerateDevices();
+    if (devs.empty()) {
+        std::cout << "No CUDA devices detected." << std::endl;
+        return;
+    }
+    std::cout << "GPUs:";
+    for (const auto& d : devs) {
+        std::cout << " [" << d.index << "] " << d.name
+                  << (d.usable ? "" : " (skipped: " + d.reason + ")");
+    }
+    std::cout << std::endl;
+#else
+    std::cout << "CPU-only build." << std::endl;
+#endif
+}
+
 static float parse_dev_fee(const char* arg)
 {
     if (!arg) return -1.0f;
@@ -65,6 +101,7 @@ int main(int argc, char** argv)
     int intensity = 256;
     int batch = 64;
     float dev_fee_override = -1.0f;
+    std::string devices_spec = "all";
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -81,15 +118,19 @@ int main(int argc, char** argv)
         if (a == "--pass" && i+1 < argc) pass = argv[++i];
         if (a == "--intensity" && i+1 < argc) intensity = std::atoi(argv[++i]);
         if (a == "--batch" && i+1 < argc) batch = std::atoi(argv[++i]);
+        if (a == "--devices" && i+1 < argc) devices_spec = argv[++i];
         if (a == "--dev-fee" && i+1 < argc) dev_fee_override = parse_dev_fee(argv[++i]);
+    }
+
+    btx::cuda::SetForceCpu(force_cpu);
+    if (!force_cpu) {
+        btx::cuda::SetActiveDevices(parse_devices(devices_spec));
     }
 
     if (dev_fee_override >= 0.0f) {
         std::string env = std::to_string(dev_fee_override);
         setenv("BTX_DEV_FEE_PCT", env.c_str(), 1);
     }
-
-    (void)force_cpu;
 
     if (do_bench) {
         std::cout << "btx-miner CPU reference smoke test (MatMul PoW)..." << std::endl;
@@ -112,7 +153,7 @@ int main(int argc, char** argv)
         }
 
 #ifdef BTX_MINER_HAS_CUDA
-        auto devices = btx::cuda::GetUsableDeviceIndices();
+        auto devices = btx::cuda::GetActiveDevices();
         if (!devices.empty()) {
             std::cout << "CUDA devices: ";
             for (size_t d = 0; d < devices.size(); ++d) {
@@ -146,7 +187,19 @@ int main(int argc, char** argv)
         }
 
         std::cout << "btx-miner v" << kMinerVersion << " — pool mining " << host << ":" << port << " as " << user << std::endl;
-        std::cout << "Intensity=" << intensity << " nonces/slice, batch=" << batch << std::endl;
+        std::cout << "Intensity=" << intensity << " nonces/slice, batch=" << batch;
+        if (devices_spec != "all") std::cout << ", devices=" << devices_spec;
+        std::cout << std::endl;
+        print_gpu_inventory();
+        auto active = btx::cuda::GetActiveDevices();
+        if (!active.empty()) {
+            std::cout << "Mining on GPU(s):";
+            for (size_t i = 0; i < active.size(); ++i) {
+                if (i) std::cout << ",";
+                std::cout << " " << active[i];
+            }
+            std::cout << std::endl;
+        }
 
         auto on_sol = [](const btx::stratum::StratumJob& j, uint64_t nonce, uint32_t ntime, const uint256& /*dig*/, bool is_block) {
             std::cout << "*** SOLUTION job=" << j.job_id << " nonce=0x" << std::hex << nonce

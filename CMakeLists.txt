@@ -96,6 +96,7 @@ set(STRATUM_SOURCES
 
 set(CUDA_SOURCES
     src/cuda/cuda_device.cpp
+    src/cuda/hashrate.cpp
     src/cuda/matmul_kernel.cu
     src/cuda/cuda_solver.cpp
 )
@@ -129,7 +130,7 @@ if(OpenSSL_FOUND)
 endif()
 
 # Always compile the CUDA host-side solver (it has CPU fallback when no CUDA)
-target_sources(btx-miner PRIVATE src/cuda/cuda_solver.cpp src/cuda/cuda_device.cpp)
+target_sources(btx-miner PRIVATE src/cuda/cuda_solver.cpp src/cuda/cuda_device.cpp src/cuda/hashrate.cpp)
 
 if(BTX_MINER_ENABLE_CUDA)
     target_sources(btx-miner PRIVATE src/cuda/matmul_kernel.cu)

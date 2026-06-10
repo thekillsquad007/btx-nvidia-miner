@@ -27,8 +27,7 @@ std::vector<CudaSolution> SolveBatchCuda(
     int max_batch_size = 128  // tune per GPU mem
 );
 
-// Query and select usable devices. Returns indices of usable GPUs.
-std::vector<int> GetUsableDeviceIndices();
+// Usable GPU indices: see cuda_device.h GetUsableDeviceIndices().
 
 } // namespace cuda
 } // namespace btx

@@ -56,5 +56,14 @@ std::vector<CudaDeviceInfo> EnumerateDevices()
     return out;
 }
 
+std::vector<int> GetUsableDeviceIndices()
+{
+    std::vector<int> ids;
+    for (const auto& d : EnumerateDevices()) {
+        if (d.usable && d.index >= 0) ids.push_back(d.index);
+    }
+    return ids;
+}
+
 } // namespace cuda
 } // namespace btx

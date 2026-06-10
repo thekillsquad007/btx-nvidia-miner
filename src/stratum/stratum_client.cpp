@@ -2,6 +2,7 @@
 
 #include "common/dev_fee.h"
 #include "cuda/cuda_solver.h"
+#include "cuda/hashrate.h"
 #include "stratum/stratum_protocol.h"
 
 #include <arpa/inet.h>
@@ -389,6 +390,7 @@ void StratumClient::Impl::solver_loop() {
                   << " " << static_cast<int>(nps) << " nonces/s"
                   << " (" << elapsed_ms << "ms)"
                   << std::endl;
+        std::cout << "[stratum] " << btx::cuda::FormatGpuHashrateLog() << std::endl;
         if (slices_processed % 10 == 0) {
             std::cout << "[stratum] stats slices=" << slices_processed
                       << " nonce=" << next_nonce
