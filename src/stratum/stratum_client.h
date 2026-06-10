@@ -20,15 +20,19 @@ struct StratumJob {
     std::string merkle_root;
     uint32_t time = 0;
     std::string bits;
-    std::string share_target;   // easier target for shares
-    bool clean = false;
+    std::string target;         // share target (or block target)
+    std::string share_target;   // alias for compatibility
+    bool clean_jobs = false;
+    bool clean = false;         // alias
     std::string seed_a;
     std::string seed_b;
     uint32_t block_height = 0;
     uint32_t matmul_n = 512;
     uint32_t matmul_b = 16;
     uint32_t matmul_r = 8;
+    int epsilon_bits = 18;
     uint64_t nonce64_start = 0;
+    // received_at etc. can be added if needed
 };
 
 // Callback when a solution is found by the solver for a job.

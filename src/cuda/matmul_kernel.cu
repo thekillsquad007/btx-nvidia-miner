@@ -137,7 +137,7 @@ __global__ void matmul_transcript_kernel(
     // that can be expanded with the exact loop from the CPU reference (CanonicalMatMul order).
 
     uint32_t tid = threadIdx.x;
-    uint32_t nonce_idx = blockIdx.x;
+    // uint32_t nonce_idx = blockIdx.x; // unused in placeholder
 
     // Placeholder: threads cooperate to "claim" work.
     if (tid == 0) {
