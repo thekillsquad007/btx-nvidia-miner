@@ -70,6 +70,8 @@ struct StratumClient::Impl {
 
     void reset_session_state();
     bool connect_socket();
+    void close_socket();
+    void join_session_threads();
     void begin_session();
     void reader_loop();
     void solver_loop();
@@ -115,13 +117,8 @@ void StratumClient::run_forever() {
             if (impl->solver_thread.joinable()) impl->solver_thread.join();
         } catch (const std::exception& e) {
             std::cerr << "[stratum] session error: " << e.what() << " — reconnecting in 5s" << std::endl;
-            if (impl->sock >= 0) {
-                shutdown(impl->sock, SHUT_RDWR);
-                close(impl->sock);
-                impl->sock = -1;
-            }
-            if (impl->reader_thread.joinable()) impl->reader_thread.join();
-            if (impl->solver_thread.joinable()) impl->solver_thread.join();
+            impl->close_socket();
+            impl->join_session_threads();
             std::this_thread::sleep_for(std::chrono::seconds(5));
         }
     }
@@ -129,14 +126,25 @@ void StratumClient::run_forever() {
 
 void StratumClient::stop() {
     impl->running = false;
-    if (impl->sock >= 0) {
-        shutdown(impl->sock, SHUT_RDWR);
-        close(impl->sock);
-        impl->sock = -1;
-    }
     impl->handshake_cv.notify_all();
-    if (impl->reader_thread.joinable()) impl->reader_thread.join();
-    if (impl->solver_thread.joinable()) impl->solver_thread.join();
+    impl->close_socket();
+    impl->join_session_threads();
+}
+
+void StratumClient::Impl::close_socket()
+{
+    if (sock >= 0) {
+        shutdown(sock, SHUT_RDWR);
+        close(sock);
+        sock = -1;
+    }
+}
+
+void StratumClient::Impl::join_session_threads()
+{
+    handshake_cv.notify_all();
+    if (reader_thread.joinable()) reader_thread.join();
+    if (solver_thread.joinable()) solver_thread.join();
 }
 
 void StratumClient::Impl::reset_session_state()
@@ -196,10 +204,18 @@ void StratumClient::Impl::begin_session()
     {
         std::unique_lock<std::mutex> lk(handshake_mutex);
         if (!handshake_cv.wait_for(lk, std::chrono::seconds(30), [&] { return subscribed || !running; })) {
+            close_socket();
+            join_session_threads();
             throw std::runtime_error("timed out waiting for mining.subscribe response");
         }
-        if (!running) return;
+        if (!running) {
+            close_socket();
+            join_session_threads();
+            return;
+        }
         if (!subscribed) {
+            close_socket();
+            join_session_threads();
             throw std::runtime_error("disconnected before subscribe completed");
         }
     }
@@ -218,6 +234,8 @@ void StratumClient::Impl::begin_session()
         std::unique_lock<std::mutex> lk(handshake_mutex);
         handshake_cv.wait_for(lk, std::chrono::seconds(30), [&] { return authorized || !auth_error.empty() || !running; });
         if (!auth_error.empty()) {
+            close_socket();
+            join_session_threads();
             throw std::runtime_error("mining.authorize rejected: " + auth_error);
         }
         if (!authorized) {
@@ -306,12 +324,17 @@ void StratumClient::Impl::dispatch_line(const std::string& line)
 
 void StratumClient::Impl::reader_loop() {
     std::string line;
-    while (running) {
-        if (!recv_line_blocking(line)) {
-            if (!running) break;
-            throw std::runtime_error("pool closed connection");
+    try {
+        while (running) {
+            if (!recv_line_blocking(line)) {
+                break;
+            }
+            dispatch_line(line);
         }
-        dispatch_line(line);
+    } catch (const std::exception& e) {
+        std::cerr << "[stratum] reader ended: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "[stratum] reader ended unexpectedly" << std::endl;
     }
 }
 

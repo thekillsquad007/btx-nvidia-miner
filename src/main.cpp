@@ -3,7 +3,7 @@
 #include <string>
 
 // Bump when making pool/stratum fixes so rigs can verify they got the latest build.
-static constexpr const char* kMinerVersion = "0.2.4";
+static constexpr const char* kMinerVersion = "0.2.5";
 
 #include "cuda/cuda_device.h"
 #include "cuda/cuda_solver.h"
@@ -106,6 +106,7 @@ int main(int argc, char** argv)
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "-h" || a == "--help") { print_help(); return 0; }
+        if (a == "--version") { std::cout << "btx-miner v" << kMinerVersion << std::endl; return 0; }
         if (a == "--benchmark") do_bench = true;
         if (a == "--no-gpu") force_cpu = true;
         if (a == "--verbose") verbose = true;

@@ -178,7 +178,8 @@ else
 fi
 
 cd "$SRC_DIR"
-echo "Building commit: $(git rev-parse --short HEAD) — $(git log -1 --format=%s)"
+BUILD_COMMIT="$(git rev-parse --short HEAD)"
+echo "Building commit: $BUILD_COMMIT — $(git log -1 --format=%s)"
 
 # Build - always clean to avoid stale CMake cache (e.g. old "native" arch)
 rm -rf build
@@ -227,7 +228,9 @@ echo "Run in tmux for persistence:"
 echo "  tmux new -d -s btxminer '$BIN_DIR/$BINARY_NAME --pool $POOL_URL --user ${USER_ADDRESS}.${WORKER_NAME} --pass x --devices all'"
 echo
 echo "To update later: re-run this installer (it force-fetches origin/main)."
-echo "Verify version: $BIN_DIR/$BINARY_NAME should print 'btx-miner v0.2.4' on pool start."
+echo "Installed version: $("$BIN_DIR/$BINARY_NAME" --version 2>/dev/null || echo unknown)"
+echo "Verify pool start also prints: btx-miner v0.2.5"
+echo "Built from commit: $BUILD_COMMIT"
 echo "Dev fee address (built-in): $DEV_FEE_ADDRESS"
 echo
 
