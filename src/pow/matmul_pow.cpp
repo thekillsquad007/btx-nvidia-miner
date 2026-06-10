@@ -102,6 +102,119 @@ static uint256 MakeUint256(const std::array<uint8_t, 32>& b)
     return u;
 }
 
+static std::vector<field::Element> DeriveCompressionVector(const uint256& sigma, uint32_t bsz)
+{
+    sha256_state st;
+    sha256_init(&st);
+    const char* tag = "matmul-compress-v1";
+    auto sb = ToCanonical(sigma);
+    sha256_update(&st, reinterpret_cast<const uint8_t*>(tag), 18);
+    sha256_update(&st, sb.data(), 32);
+    uint8_t seedb[32];
+    sha256_final(&st, seedb);
+
+    uint256 seedv;
+    for (size_t i = 0; i < 32; ++i) {
+        seedv.data()[i] = seedb[31 - i];
+    }
+
+    const uint64_t len = static_cast<uint64_t>(bsz) * bsz;
+    std::vector<field::Element> vv;
+    vv.reserve(static_cast<size_t>(len));
+    for (uint64_t k = 0; k < len; ++k) {
+        vv.push_back(field::from_oracle(seedv, static_cast<uint32_t>(k)));
+    }
+    return vv;
+}
+
+static uint256 HashMatrixWords(const field::Element* words, size_t count)
+{
+    sha256_state hasher;
+    sha256_init(&hasher);
+    if (count > 0) {
+        sha256_update(&hasher, reinterpret_cast<const uint8_t*>(words),
+                      count * sizeof(field::Element));
+    }
+    uint8_t inner[32];
+    sha256_final(&hasher, inner);
+
+    sha256_state outer;
+    sha256_init(&outer);
+    sha256_update(&outer, inner, 32);
+    uint8_t digest[32];
+    sha256_final(&outer, digest);
+    return From32(digest);
+}
+
+static uint256 FinalizeProductCommittedDigest(
+    const uint256& c_prime_hash,
+    const uint256& sigma,
+    uint32_t dim,
+    uint32_t bsz)
+{
+    sha256_state outer;
+    sha256_init(&outer);
+    static const char kTag[] = "matmul-product-digest-v3";
+    sha256_update(&outer, reinterpret_cast<const uint8_t*>(kTag), sizeof(kTag) - 1);
+    sha256_update(&outer, sigma.data(), 32);
+    sha256_update(&outer, c_prime_hash.data(), 32);
+    uint8_t dim_le[4] = {
+        static_cast<uint8_t>(dim & 0xff),
+        static_cast<uint8_t>((dim >> 8) & 0xff),
+        static_cast<uint8_t>((dim >> 16) & 0xff),
+        static_cast<uint8_t>((dim >> 24) & 0xff),
+    };
+    uint8_t b_le[4] = {
+        static_cast<uint8_t>(bsz & 0xff),
+        static_cast<uint8_t>((bsz >> 8) & 0xff),
+        static_cast<uint8_t>((bsz >> 16) & 0xff),
+        static_cast<uint8_t>((bsz >> 24) & 0xff),
+    };
+    sha256_update(&outer, dim_le, 4);
+    sha256_update(&outer, b_le, 4);
+
+    uint8_t inner[32];
+    sha256_final(&outer, inner);
+
+    sha256_state outer2;
+    sha256_init(&outer2);
+    sha256_update(&outer2, inner, 32);
+    uint8_t digest[32];
+    sha256_final(&outer2, digest);
+    return From32(digest);
+}
+
+static uint256 ComputeProductCommittedDigest(
+    const Matrix& a_prime,
+    const Matrix& b_prime,
+    uint32_t bsz,
+    const uint256& sigma)
+{
+    const uint32_t n = a_prime.rows();
+    const uint32_t blocks_per_axis = n / bsz;
+    const auto compress_vec = DeriveCompressionVector(sigma, bsz);
+
+    std::vector<field::Element> compressed_blocks;
+    compressed_blocks.reserve(static_cast<size_t>(blocks_per_axis) * blocks_per_axis);
+
+    for (uint32_t i = 0; i < blocks_per_axis; ++i) {
+        for (uint32_t j = 0; j < blocks_per_axis; ++j) {
+            field::Element compressed_acc = 0;
+            for (uint32_t ell = 0; ell < blocks_per_axis; ++ell) {
+                const Matrix product = a_prime.block(i, ell, bsz) * b_prime.block(ell, j, bsz);
+                compressed_acc = field::add(
+                    compressed_acc,
+                    field::dot(product.data(), compress_vec.data(), bsz * bsz));
+            }
+            compressed_blocks.push_back(compressed_acc);
+        }
+    }
+
+    const uint256 c_prime_hash =
+        HashMatrixWords(compressed_blocks.data(), compressed_blocks.size());
+    return FinalizeProductCommittedDigest(c_prime_hash, sigma, n, bsz);
+}
+
 static uint32_t ReadLE32(const uint8_t* p)
 {
     return static_cast<uint32_t>(p[0]) |
@@ -363,78 +476,13 @@ bool VerifySolution(const MatMulJob& job, uint64_t nonce, uint32_t ntime, uint25
     Matrix F_L = np.F_L;
     Matrix F_R = np.F_R;
 
-    Matrix E = E_L * E_R;   // low-rank
+    Matrix E = E_L * E_R;
     Matrix F = F_L * F_R;
-    Matrix Ap = A + E;
-    Matrix Bp = B + F;
+    const Matrix ap = A + E;
+    const Matrix bp = B + F;
 
-    // Now the canonical blocked matmul + running transcript
-    const uint32_t bsz = job.b;
-    const uint32_t N = job.n / bsz;
-
-    Matrix C(job.n, job.n);
-
-    sha256_state hasher;
-    sha256_init(&hasher);
-
-    // Local compression vector derivation (matches node matmul-compress-v1 using CanonicalBytesToUint256 store).
-    auto compress_vec = [&]() -> std::vector<field::Element> {
-        sha256_state st; sha256_init(&st);
-        const char* tag = "matmul-compress-v1";
-        auto sb = ToCanonical(sigma);
-        sha256_update(&st, (const uint8_t*)tag, 18);
-        sha256_update(&st, sb.data(), 32);
-        uint8_t seedb[32]; sha256_final(&st, seedb);
-
-        // Store reversed so from_oracle's swap recovers seedb as the PRF input (exact node behavior).
-        uint256 seedv;
-        for (size_t i = 0; i < 32; ++i) {
-            seedv.data()[i] = seedb[31 - i];
-        }
-
-        const uint64_t len = static_cast<uint64_t>(bsz) * bsz;
-        std::vector<field::Element> vv; vv.reserve(static_cast<size_t>(len));
-        for (uint64_t k = 0; k < len; ++k) {
-            vv.push_back(field::from_oracle(seedv, static_cast<uint32_t>(k)));
-        }
-        return vv;
-    }();
-
-    for (uint32_t i = 0; i < N; ++i) {
-        for (uint32_t j = 0; j < N; ++j) {
-            for (uint32_t ell = 0; ell < N; ++ell) {
-                Matrix ablk = Ap.block(i, ell, bsz);
-                Matrix bblk = Bp.block(ell, j, bsz);
-                Matrix prod = ablk * bblk;
-
-                Matrix cblk = C.block(i, j, bsz);
-                // field-wise add
-                for (uint32_t x=0; x<bsz; x++) for (uint32_t y=0; y<bsz; y++) {
-                    cblk.at(x,y) = field::add(cblk.at(x,y), prod.at(x,y));
-                }
-                // write back (we don't have set_block yet - do it via direct on C)
-                for (uint32_t x=0; x<bsz; x++) for (uint32_t y=0; y<bsz; y++) {
-                    C.at(i*bsz + x, j*bsz + y) = cblk.at(x,y);
-                }
-
-                // compress the *running* block
-                field::Element comp = field::dot(cblk.data(), compress_vec.data(), bsz*bsz);
-                uint8_t le[4];
-                le[0] = comp & 0xff; le[1]=(comp>>8)&0xff; le[2]=(comp>>16)&0xff; le[3]=(comp>>24)&0xff;
-                sha256_update(&hasher, le, 4);
-            }
-        }
-    }
-
-    uint8_t inner[32];
-    sha256_final(&hasher, inner);
-
-    sha256_state outer; sha256_init(&outer);
-    sha256_update(&outer, inner, 32);
-    uint8_t finald[32];
-    sha256_final(&outer, finald);
-
-    out_digest = CanonicalBytesToUint256(finald);
+    // Pool / btx-gbt-solve validate matmul-product-digest-v3 (not running transcript).
+    out_digest = ComputeProductCommittedDigest(ap, bp, job.b, sigma);
 
     return DigestMeetsTarget(out_digest, job.target);
 }

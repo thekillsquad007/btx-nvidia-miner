@@ -582,6 +582,60 @@ __device__ bool d_uint256_le(const uint8_t digest[32], const uint8_t target[32])
     return true;
 }
 
+__device__ void d_hash_matrix_words(const uint32_t* words, uint32_t count, uint8_t out[32])
+{
+    Sha256State hasher;
+    d_sha256_init(&hasher);
+    if (count > 0) {
+        d_sha256_update(&hasher, reinterpret_cast<const uint8_t*>(words),
+                        static_cast<size_t>(count) * sizeof(uint32_t));
+    }
+    uint8_t inner[32];
+    d_sha256_final(&hasher, inner);
+
+    Sha256State outer;
+    d_sha256_init(&outer);
+    d_sha256_update(&outer, inner, 32);
+    d_sha256_final(&outer, out);
+}
+
+__device__ void d_finalize_product_digest(
+    const uint8_t* sigma_data,
+    const uint8_t* c_prime_data,
+    uint32_t n,
+    uint32_t bsz,
+    uint8_t digest_out[32])
+{
+    Sha256State outer;
+    d_sha256_init(&outer);
+    static const char kTag[] = "matmul-product-digest-v3";
+    d_sha256_update(&outer, reinterpret_cast<const uint8_t*>(kTag), sizeof(kTag) - 1);
+    d_sha256_update(&outer, sigma_data, 32);
+    d_sha256_update(&outer, c_prime_data, 32);
+    uint8_t dim_le[4] = {
+        static_cast<uint8_t>(n & 0xff),
+        static_cast<uint8_t>((n >> 8) & 0xff),
+        static_cast<uint8_t>((n >> 16) & 0xff),
+        static_cast<uint8_t>((n >> 24) & 0xff),
+    };
+    uint8_t b_le[4] = {
+        static_cast<uint8_t>(bsz & 0xff),
+        static_cast<uint8_t>((bsz >> 8) & 0xff),
+        static_cast<uint8_t>((bsz >> 16) & 0xff),
+        static_cast<uint8_t>((bsz >> 24) & 0xff),
+    };
+    d_sha256_update(&outer, dim_le, 4);
+    d_sha256_update(&outer, b_le, 4);
+
+    uint8_t inner[32];
+    d_sha256_final(&outer, inner);
+
+    Sha256State outer2;
+    d_sha256_init(&outer2);
+    d_sha256_update(&outer2, inner, 32);
+    d_sha256_final(&outer2, digest_out);
+}
+
 __device__ void d_build_compress_vec(const uint8_t* sigma_internal, uint32_t bsz, uint32_t* compress_v)
 {
     __shared__ uint8_t s_seed_internal[32];
@@ -633,7 +687,6 @@ __device__ bool d_solve_nonce(
     __shared__ uint8_t s_seed_er[32];
     __shared__ uint8_t s_seed_fl[32];
     __shared__ uint8_t s_seed_fr[32];
-    __shared__ Sha256State s_hasher;
     __shared__ bool s_hit;
     __shared__ bool s_sigma_pass;
     __shared__ uint8_t s_seed_a[32];
@@ -675,23 +728,19 @@ __device__ bool d_solve_nonce(
     d_fill_rect(F_R, job.r, job.n, s_seed_fr);
     __syncthreads();
 
-    const uint32_t nn = job.n * job.n;
-    d_zero_u32(C, nn);
+    const uint32_t bsz = job.b;
+    const uint32_t N = job.n / bsz;
+    const uint32_t word_count = N * N;
+
+    d_zero_u32(C, word_count);
     __syncthreads();
 
     d_build_compress_vec(s_sigma, job.b, compress_v);
     __syncthreads();
 
-    const uint32_t bsz = job.b;
-    const uint32_t N = job.n / bsz;
     const uint32_t total_steps = N * N * N;
 
-    if (threadIdx.x == 0) {
-        d_sha256_init(&s_hasher);
-    }
-    __syncthreads();
-
-    // Flat step loop: all threads share the same (bi,bj,ell) each iteration.
+    // Product-committed digest: sum compress(A'[i,ell]*B'[ell,j]) over ell per (i,j).
     for (uint32_t step = 0; step < total_steps; ++step) {
         const uint32_t bi = step / (N * N);
         const uint32_t rem = step % (N * N);
@@ -718,36 +767,18 @@ __device__ bool d_solve_nonce(
         d_block_matmul(prod, ablk, bblk, bsz);
         __syncthreads();
 
-        d_mat_get(C, job.n, row0, col0, cblk, bsz);
-        __syncthreads();
-        d_add_block(cblk, prod, bsz);
-        __syncthreads();
-        d_write_c_block(C, job.n, row0, col0, cblk, bsz);
-        __syncthreads();
-
         if (threadIdx.x == 0) {
-            const uint32_t comp = d_dot(cblk, compress_v, bsz * bsz);
-            uint8_t le[4] = {
-                static_cast<uint8_t>(comp & 0xff),
-                static_cast<uint8_t>((comp >> 8) & 0xff),
-                static_cast<uint8_t>((comp >> 16) & 0xff),
-                static_cast<uint8_t>((comp >> 24) & 0xff),
-            };
-            d_sha256_update(&s_hasher, le, 4);
+            const uint32_t word_idx = bi * N + bj;
+            const uint32_t term = d_dot(prod, compress_v, bsz * bsz);
+            C[word_idx] = d_add(C[word_idx], term);
         }
         __syncthreads();
     }
 
     if (threadIdx.x == 0) {
-        uint8_t inner[32];
-        d_sha256_final(&s_hasher, inner);
-
-        Sha256State outer;
-        d_sha256_init(&outer);
-        d_sha256_update(&outer, inner, 32);
-        uint8_t raw_digest[32];
-        d_sha256_final(&outer, raw_digest);
-        d_canonicalize_sha256(raw_digest, digest_out);
+        uint8_t c_prime[32];
+        d_hash_matrix_words(C, word_count, c_prime);
+        d_finalize_product_digest(s_sigma, c_prime, job.n, bsz, digest_out);
         s_hit = d_uint256_le(digest_out, job.target);
     }
     __syncthreads();
