@@ -139,11 +139,11 @@ std::string FormatGpuHashrateLog()
         ss << " " << (s.device >= 0 ? "GPU" + std::to_string(s.device) : "CPU")
            << " " << s.name
            << " " << std::fixed << std::setprecision(2) << s.slice_nonces_per_sec
-           << " H/s (avg " << s.average_nonces_per_sec << " H/s)";
+           << " N/s (avg " << s.average_nonces_per_sec << " N/s)";
         total_avg += s.average_nonces_per_sec;
     }
     if (samples.size() > 1) {
-        ss << " | total " << std::fixed << std::setprecision(2) << total_avg << " H/s";
+        ss << " | total " << std::fixed << std::setprecision(2) << total_avg << " N/s";
     }
     return ss.str();
 }

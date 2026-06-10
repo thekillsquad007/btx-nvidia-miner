@@ -358,8 +358,9 @@ void StratumClient::Impl::dispatch_line(const std::string& line)
         if (ParseNotifyLine(line, j)) {
             handle_notify(j);
         } else {
-            std::cerr << "[stratum] failed to parse mining.notify: "
-                      << line.substr(0, 200) << std::endl;
+            LogLine("[stratum] failed to parse mining.notify (" +
+                    std::to_string(line.size()) + " bytes): " +
+                    line.substr(0, 200));
         }
         return;
     }
@@ -506,16 +507,27 @@ void StratumClient::Impl::handle_notify(const StratumJob& incoming)
 
 void StratumClient::Impl::solver_loop() {
     LogLine("[stratum] solver loop ready");
+    int job_wait_polls = 0;
     while (running) {
         StratumJob job;
+        bool waiting_for_job = false;
         {
             std::lock_guard<std::mutex> lk(job_mutex);
             if (!has_job) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                continue;
+                waiting_for_job = true;
+            } else {
+                job = current_job;
             }
-            job = current_job;
         }
+        if (waiting_for_job) {
+            ++job_wait_polls;
+            if (job_wait_polls == 1 || job_wait_polls % 50 == 0) {
+                LogLine("[stratum] waiting for mining.notify from pool...");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
+        }
+        job_wait_polls = 0;
 
         uint64_t slice_start = 0;
         {
