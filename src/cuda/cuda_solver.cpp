@@ -69,89 +69,71 @@ std::vector<CudaSolution> SolveBatchCuda(
 #ifdef BTX_MINER_HAS_CUDA
     auto usable = GetUsableDeviceIndices();
     if (!usable.empty()) {
+        // For v1: use first device (multi-GPU round-robin can be added later)
+        int dev = usable[0];
 
-    // For v1: use first device for simplicity (multi-GPU can round-robin batches later)
-    int dev = usable[0];
+        uint64_t current_nonce = start_nonce;
+        uint64_t remaining = max_tries;
 
-#ifdef BTX_MINER_HAS_CUDA
-    // We will process in sub-batches.
-    // For correctness-first: on host, for each nonce in subbatch, use the
-    // reference pow code to compute the full A_prime / B_prime (via noise),
-    // upload them, let kernel compute the transcript hash only.
-    // This way the expensive part (n^3 per nonce) is on GPU.
+        while (remaining > 0) {
+            int batch = static_cast<int>(std::min<uint64_t>(remaining, max_batch_size));
+            std::vector<uint64_t> batch_nonces;
+            batch_nonces.reserve(batch);
+            for (int i = 0; i < batch; ++i) {
+                batch_nonces.push_back(current_nonce + i);
+            }
 
-    uint64_t nonce = start_nonce;
-    uint64_t remaining = max_tries;
+            std::vector<uint256> digests(batch);
+            std::vector<bool> found(batch, false);
 
-    while (remaining > 0) {
-        int batch = static_cast<int>(std::min<uint64_t>(remaining, max_batch_size));
-        std::vector<uint64_t> batch_nonces;
-        batch_nonces.reserve(batch);
-        for (int i = 0; i < batch; ++i) {
-            batch_nonces.push_back(nonce + i);
-        }
+            bool launched = LaunchMatMulTranscriptBatch(
+                dev, job, batch_nonces, job.target,
+                digests, found
+            );
 
-        std::vector<uint256> digests(batch);
-        std::vector<bool> found(batch, false);
+            if (!launched) {
+                break;
+            }
 
-        bool launched = LaunchMatMulTranscriptBatch(
-            dev, job, batch_nonces, job.target,
-            digests, found
-        );
-
-        if (!launched) {
-            break;
-        }
-
-        // Strict cross-check with CPU reference for every candidate the device reported.
-        for (int i = 0; i < batch; ++i) {
-            if (found[i]) {
-                uint256 cpu_d;
-                if (pow::VerifySolution(job, batch_nonces[i], job.time, cpu_d) &&
-                    cpu_d == digests[i]) {
-                    // Compare against the job target (works for both share and block targets)
-                    const uint8_t* dd = reinterpret_cast<const uint8_t*>(&digests[i]);
-                    bool below = true;
-                    for (size_t k = 0; k < job.target.size() && k < 32; ++k) {
-                        if (dd[k] > job.target[k]) { below = false; break; }
-                        if (dd[k] < job.target[k]) break;
-                    }
-                    if (below) {
-                        CudaSolution sol;
-                        sol.found = true;
-                        sol.nonce = batch_nonces[i];
-                        sol.ntime = job.time;
-                        sol.digest = digests[i];
-                        solutions.push_back(sol);
+            // Cross-check every candidate reported by the device
+            for (int i = 0; i < batch; ++i) {
+                if (found[i]) {
+                    uint256 cpu_d;
+                    if (pow::VerifySolution(job, batch_nonces[i], job.time, cpu_d) &&
+                        cpu_d == digests[i]) {
+                        const uint8_t* dd = reinterpret_cast<const uint8_t*>(&digests[i]);
+                        bool below = true;
+                        for (size_t k = 0; k < job.target.size() && k < 32; ++k) {
+                            if (dd[k] > job.target[k]) { below = false; break; }
+                            if (dd[k] < job.target[k]) break;
+                        }
+                        if (below) {
+                            CudaSolution sol;
+                            sol.found = true;
+                            sol.nonce = batch_nonces[i];
+                            sol.ntime = job.time;
+                            sol.digest = digests[i];
+                            solutions.push_back(sol);
+                        }
                     }
                 }
             }
+
+            current_nonce += batch;
+            remaining -= batch;
         }
 
-        nonce += batch;
-        remaining -= batch;
+        return solutions;
     }
-
-#else
-    (void)dev;
-    (void)job;
-    (void)start_nonce;
-    (void)max_tries;
-    (void)max_batch_size;
 #endif
 
-    return solutions;
-#else
-    // No CUDA compiled in - always use CPU reference
-    (void)max_batch_size;
-#endif
-
-    // CPU reference fallback / when no GPU or CUDA disabled
-    uint64_t nonce = start_nonce;
+    // CPU reference fallback (used when no CUDA, no usable GPU, or CUDA not enabled)
+    uint64_t current_nonce = start_nonce;
     uint64_t remaining = max_tries;
+
     while (remaining > 0) {
         uint256 d;
-        if (pow::VerifySolution(job, nonce, job.time, d)) {
+        if (pow::VerifySolution(job, current_nonce, job.time, d)) {
             const uint8_t* dd = reinterpret_cast<const uint8_t*>(&d);
             bool below = true;
             for (size_t k = 0; k < job.target.size() && k < 32; ++k) {
@@ -161,14 +143,14 @@ std::vector<CudaSolution> SolveBatchCuda(
             if (below) {
                 CudaSolution sol;
                 sol.found = true;
-                sol.nonce = nonce;
+                sol.nonce = current_nonce;
                 sol.ntime = job.time;
                 sol.digest = d;
                 solutions.push_back(sol);
             }
         }
-        if (nonce == UINT64_MAX) break;
-        ++nonce;
+        if (current_nonce == UINT64_MAX) break;
+        ++current_nonce;
         --remaining;
     }
     return solutions;

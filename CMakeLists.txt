@@ -54,9 +54,12 @@ else()
 endif()
 
 if(BTX_MINER_ENABLE_CUDA)
-    # Reasonable default arch list; user can override with -DCUDA_ARCHS="86;89;120"
+    # Safe default arches for common NVIDIA cards (Ampere+).
+    # User can override: -DCUDA_ARCHS="86;89;90"
+    # Avoid "native" because it can produce 'compute_native' which old nvcc or certain
+    # build environments (containers, WSL, Hive OS partial installs) do not understand.
     if(NOT DEFINED CUDA_ARCHS)
-        set(CUDA_ARCHS "native")
+        set(CUDA_ARCHS "75;80;86;89;90")
     endif()
     set(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCHS})
 
