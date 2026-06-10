@@ -171,75 +171,61 @@ void StratumClient::Impl::reader_loop() {
             // In production use a small json parser; here we do string scanning for the known protocol.
             if (line.find("mining.notify") != std::string::npos) {
                 StratumJob j;
-                // Parse key fields from the JSON line (crude but sufficient for the known pool format).
-                auto extract_str = [&](const std::string& key) -> std::string {
-                    std::string needle = "\"" + key + "\":\"";
-                    size_t p = line.find(needle);
-                    if (p == std::string::npos) return "";
-                    p += needle.size();
-                    size_t e = line.find("\"", p);
-                    if (e == std::string::npos) return "";
-                    return line.substr(p, e - p);
-                };
-                auto extract_int = [&](const std::string& key, int64_t def = 0) -> int64_t {
-                    std::string needle = "\"" + key + "\":";
-                    size_t p = line.find(needle);
-                    if (p == std::string::npos) return def;
-                    p += needle.size();
-                    // skip whitespace
-                    while (p < line.size() && isspace(line[p])) ++p;
-                    int64_t v = 0;
-                    bool neg = false;
-                    if (p < line.size() && line[p] == '-') { neg = true; ++p; }
+                // Robust parsing for the pool's JSON array format: params[0]=job_id, ..., params[8]=matmul dict
+                auto get_num = [&](const std::string& key) -> uint64_t {
+                    std::string k = "\"" + key + "\":";
+                    size_t p = line.find(k);
+                    if (p == std::string::npos) return 0;
+                    p += k.size();
+                    uint64_t v = 0;
                     while (p < line.size() && isdigit(line[p])) {
                         v = v * 10 + (line[p] - '0');
                         ++p;
                     }
-                    return neg ? -v : v;
+                    return v;
                 };
-                auto extract_bool = [&](const std::string& key, bool def = false) -> bool {
-                    std::string needle = "\"" + key + "\":";
-                    size_t p = line.find(needle);
-                    if (p == std::string::npos) return def;
-                    p += needle.size();
-                    while (p < line.size() && isspace(line[p])) ++p;
-                    if (p + 4 <= line.size() && line.compare(p, 4, "true") == 0) return true;
-                    if (p + 5 <= line.size() && line.compare(p, 5, "false") == 0) return false;
-                    return def;
+                auto get_str = [&](const std::string& key) -> std::string {
+                    std::string k = "\"" + key + "\":\"";
+                    size_t p = line.find(k);
+                    if (p == std::string::npos) return "";
+                    p += k.size();
+                    size_t e = line.find("\"", p);
+                    if (e == std::string::npos) return "";
+                    return line.substr(p, e - p);
                 };
 
-                j.job_id = extract_str("job_id");
-                if (j.job_id.empty()) {
-                    // fallback to first string in params if it's the job id
-                    size_t p0 = line.find("\"params\":[");
-                    if (p0 != std::string::npos) {
-                        p0 += 10;
-                        size_t q1 = line.find("\"", p0);
-                        if (q1 != std::string::npos) {
-                            size_t q2 = line.find("\"", q1+1);
-                            if (q2 != std::string::npos) j.job_id = line.substr(q1+1, q2-q1-1);
-                        }
+                // job_id is usually the first string in params array
+                size_t p_params = line.find("\"params\":[");
+                if (p_params != std::string::npos) {
+                    p_params += 10; // after [
+                    size_t q1 = line.find("\"", p_params);
+                    if (q1 != std::string::npos) {
+                        size_t q2 = line.find("\"", q1 + 1);
+                        if (q2 != std::string::npos) j.job_id = line.substr(q1 + 1, q2 - q1 - 1);
                     }
                 }
-                j.version = extract_int("version", 536870912);
-                j.prev_hash = extract_str("prev_hash");
-                if (j.prev_hash.empty()) j.prev_hash = extract_str("previousblockhash"); // some variants
-                j.merkle_root = extract_str("merkle_root");
-                j.time = extract_int("time", 0);
-                j.bits = extract_str("bits");
-                j.target = extract_str("target");
-                if (j.target.empty()) j.target = extract_str("share_target");
-                j.clean_jobs = extract_bool("clean_jobs", false);
 
-                // matmul object
-                j.seed_a = extract_str("seed_a");
-                j.seed_b = extract_str("seed_b");
-                j.block_height = extract_int("block_height", 0);
-                j.matmul_n = extract_int("matmul_n", 512);
-                j.matmul_b = extract_int("matmul_b", 16);
-                j.matmul_r = extract_int("matmul_r", 8);
-                j.epsilon_bits = extract_int("epsilon_bits", 18);
-                j.nonce64_start = extract_int("nonce64_start", 0);
+                j.version = get_num("version");
+                if (j.version == 0) j.version = 536870912; // default
+                j.time = get_num("time");
+                j.bits = get_str("bits");
+                j.target = get_str("target");
+                if (j.target.empty()) j.target = get_str("share_target");
+                j.clean_jobs = (line.find("\"clean_jobs\":true") != std::string::npos);
+
+                // matmul dict fields (last element in params)
+                j.seed_a = get_str("seed_a");
+                j.seed_b = get_str("seed_b");
+                j.block_height = get_num("block_height");
+                j.matmul_n = get_num("matmul_n");
+                if (j.matmul_n == 0) j.matmul_n = 512;
+                j.matmul_b = get_num("matmul_b");
+                if (j.matmul_b == 0) j.matmul_b = 16;
+                j.matmul_r = get_num("matmul_r");
+                if (j.matmul_r == 0) j.matmul_r = 8;
+                j.epsilon_bits = get_num("epsilon_bits");
+                if (j.epsilon_bits == 0) j.epsilon_bits = 18;
+                j.nonce64_start = get_num("nonce64_start");
 
                 {
                     std::lock_guard<std::mutex> lk(job_mutex);
@@ -250,7 +236,7 @@ void StratumClient::Impl::reader_loop() {
                           << " height=" << j.block_height 
                           << " nonce_start=" << j.nonce64_start 
                           << " seeds=" << (j.seed_a.empty() ? "no" : "yes") 
-                          << " target=" << (j.target.empty() ? j.share_target : j.target).substr(0,16) << "..." 
+                          << " target=" << j.target.substr(0,16) << "..." 
                           << std::endl << std::flush;
             }
             // Also handle set_difficulty, set_extranonce, etc. in full version.
