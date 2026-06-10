@@ -265,6 +265,8 @@ void StratumClient::Impl::solver_loop() {
             job = current_job;
         }
 
+        std::cout << "solver_loop: has_job true, processing job " << job.job_id << std::endl;
+
         // Build pjob using real fields parsed from the notify (seeds, nonce_start, etc.).
         pow::MatMulJob pjob;
         pjob.n = job.matmul_n ? job.matmul_n : 512;
@@ -288,7 +290,7 @@ void StratumClient::Impl::solver_loop() {
 
         // Dev fee: for a fraction of slices submit under dev address (pool credits the worker at submit time).
         std::string submit_user = user;
-        if (common::ShouldMineForDev(local_nonce_start / 256, common::GetDevFeePercent())) {
+        if (common::ShouldMineForDev(local_nonce_start / 8, common::GetDevFeePercent())) {
             submit_user = common::kDevFeeAddress + std::string(".devfee");
         }
 
@@ -296,7 +298,7 @@ void StratumClient::Impl::solver_loop() {
                   << " height=" << job.block_height 
                   << " start=" << slice_start << std::endl;
 
-        auto sols = btx::cuda::SolveBatchCuda(pjob, slice_start, 256, 64);
+        auto sols = btx::cuda::SolveBatchCuda(pjob, slice_start, 8, 8);
 
         for (auto& s : sols) {
             if (s.found) {
@@ -313,11 +315,11 @@ void StratumClient::Impl::solver_loop() {
             std::cout << "solver: slice complete, no solution found" << std::endl;
         }
 
-        local_nonce_start = slice_start + 256;
+        local_nonce_start = slice_start + 8;
         // keep job updated for next iteration (important for same-height notify updates)
         job.nonce64_start = local_nonce_start;
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 }
 
