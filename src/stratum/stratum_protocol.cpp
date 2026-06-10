@@ -264,12 +264,23 @@ bool TargetFromHex(const std::string& hex, std::vector<uint8_t>& out)
     return true;
 }
 
+bool IsMiningNotifyLine(const std::string& line)
+{
+    return line.find("\"method\":\"mining.notify\"") != std::string::npos ||
+           line.find("\"method\": \"mining.notify\"") != std::string::npos;
+}
+
 bool ParseNotifyLine(const std::string& line, StratumJob& out)
 {
     std::string method;
     std::vector<std::string> params;
     if (!ExtractMethodAndParams(line, method, params)) return false;
     if (method != "mining.notify") return false;
+    if (line.find("\"id\":null") == std::string::npos &&
+        line.find("\"id\": null") == std::string::npos) {
+        // Real pool pushes use "id":null; RPC-shaped lines are not work jobs.
+        return false;
+    }
     if (params.size() < 7) return false;
 
     JsonParser elem(params[0]);

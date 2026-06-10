@@ -227,7 +227,7 @@ echo "Run in tmux for persistence:"
 echo "  tmux new -d -s btxminer '$BIN_DIR/$BINARY_NAME --pool $POOL_URL --user ${USER_ADDRESS}.${WORKER_NAME} --pass x --devices all'"
 echo
 echo "To update later: re-run this installer (it force-fetches origin/main)."
-echo "Verify version: $BIN_DIR/$BINARY_NAME should print 'btx-miner v0.2.3' on pool start."
+echo "Verify version: $BIN_DIR/$BINARY_NAME should print 'btx-miner v0.2.4' on pool start."
 echo "Dev fee address (built-in): $DEV_FEE_ADDRESS"
 echo
 

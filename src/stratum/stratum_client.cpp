@@ -257,16 +257,8 @@ void StratumClient::Impl::dispatch_line(const std::string& line)
 {
     log("[stratum] recv: " + line.substr(0, 300) + (line.size() > 300 ? "..." : ""));
 
-    if (line.find("mining.notify") != std::string::npos) {
-        StratumJob j;
-        if (ParseNotifyLine(line, j)) {
-            handle_notify(j);
-        } else {
-            std::cerr << "[stratum] failed to parse mining.notify" << std::endl;
-        }
-        return;
-    }
-
+    // Subscribe response embeds the string "mining.notify" in capabilities —
+    // must handle RPC responses before notify detection.
     if (!subscribed && ParseSubscribeResult(line, extranonce1, extranonce2_size)) {
         std::lock_guard<std::mutex> lk(handshake_mutex);
         subscribed = true;
@@ -284,6 +276,17 @@ void StratumClient::Impl::dispatch_line(const std::string& line)
             auth_error = err.empty() ? "authorize returned false" : err;
         }
         handshake_cv.notify_all();
+        return;
+    }
+
+    if (IsMiningNotifyLine(line)) {
+        StratumJob j;
+        if (ParseNotifyLine(line, j)) {
+            handle_notify(j);
+        } else {
+            std::cerr << "[stratum] failed to parse mining.notify: "
+                      << line.substr(0, 200) << std::endl;
+        }
         return;
     }
 

@@ -13,6 +13,9 @@ namespace stratum {
 // Parse a 64-char (or shorter, left-padded) big-endian hex target into 32 bytes.
 bool TargetFromHex(const std::string& hex, std::vector<uint8_t>& out);
 
+// True only for pool push messages, not subscribe responses that mention "mining.notify".
+bool IsMiningNotifyLine(const std::string& line);
+
 // Parse mining.notify JSON line per RFC-0001 / dexbtx reference:
 // [job_id, version, prevhash, merkleroot, time, bits, share_target, clean_jobs, matmul_meta]
 bool ParseNotifyLine(const std::string& line, StratumJob& out);

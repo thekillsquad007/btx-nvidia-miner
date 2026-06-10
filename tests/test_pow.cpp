@@ -14,10 +14,20 @@ static void test_target_from_hex()
     assert(t[31] == 0x00);
 }
 
+static void test_subscribe_not_confused_with_notify()
+{
+    const std::string sub = R"({"id":1,"result":[[["mining.notify","6a2894a7000017f4"]],"000017f4",4],"error":null})";
+    assert(!btx::stratum::IsMiningNotifyLine(sub));
+    std::string en1;
+    int en2 = 0;
+    assert(btx::stratum::ParseSubscribeResult(sub, en1, en2));
+}
+
 static void test_parse_live_notify()
 {
     const std::string line = R"({"id":null,"method":"mining.notify","params":["0000000000002c88",536870912,"e41768fe0c8ed2d40b967c981e3af7cddf6fc495f844563836756fa76a0d2ec9","fe14530b149adfa21a45f7d2666f3c2dbef7296333398ba208ab77ea6b44a6e2",1781098511,"1d14bd00","000052f400000000000000000000000000000000000000000000000000000000",true,{"block_height":126655,"epsilon_bits":18,"matmul_b":16,"matmul_n":512,"matmul_r":8,"nonce64_start":26336739459072,"seed_a":"a6f74b5acf03e8b9955f1e8503045f868223e6a21add4bd1d287df4828f232c6","seed_b":"a257d5579fb72a5bbee627db164336b8aea91095af751ddbae91de568da04597"}]})";
 
+    assert(btx::stratum::IsMiningNotifyLine(line));
     btx::stratum::StratumJob job;
     assert(btx::stratum::ParseNotifyLine(line, job));
     assert(job.seed_b.size() == 64);
@@ -86,6 +96,7 @@ static void test_pow_smoke()
 int main()
 {
     test_target_from_hex();
+    test_subscribe_not_confused_with_notify();
     test_parse_live_notify();
     test_parse_notify();
     test_parse_subscribe();
