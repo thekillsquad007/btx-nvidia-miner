@@ -166,21 +166,86 @@ void StratumClient::Impl::reader_loop() {
             // Very lightweight JSON parse for the fields we care about.
             // In production use a small json parser; here we do string scanning for the known protocol.
             if (line.find("mining.notify") != std::string::npos) {
-                // Extract params array roughly.
-                // For a real robust client we would parse the 9-element array.
-                // Here we simulate by looking for known keys in the line (the pool sends them).
                 StratumJob j;
-                // Minimal extraction for the demo (in real code parse the JSON array properly).
-                // We assume the notify format from the dexbtx reference we studied.
-                j.job_id = "job-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
-                // In a full impl we would parse version, prev, merkle, time, bits, share_target, clean, then the matmul object.
-                // For this step we just mark that we have a job and the solver loop will use a constructed job from the last known or defaults.
+                // Parse key fields from the JSON line (crude but sufficient for the known pool format).
+                auto extract_str = [&](const std::string& key) -> std::string {
+                    std::string needle = "\"" + key + "\":\"";
+                    size_t p = line.find(needle);
+                    if (p == std::string::npos) return "";
+                    p += needle.size();
+                    size_t e = line.find("\"", p);
+                    if (e == std::string::npos) return "";
+                    return line.substr(p, e - p);
+                };
+                auto extract_int = [&](const std::string& key, int64_t def = 0) -> int64_t {
+                    std::string needle = "\"" + key + "\":";
+                    size_t p = line.find(needle);
+                    if (p == std::string::npos) return def;
+                    p += needle.size();
+                    // skip whitespace
+                    while (p < line.size() && isspace(line[p])) ++p;
+                    int64_t v = 0;
+                    bool neg = false;
+                    if (p < line.size() && line[p] == '-') { neg = true; ++p; }
+                    while (p < line.size() && isdigit(line[p])) {
+                        v = v * 10 + (line[p] - '0');
+                        ++p;
+                    }
+                    return neg ? -v : v;
+                };
+                auto extract_bool = [&](const std::string& key, bool def = false) -> bool {
+                    std::string needle = "\"" + key + "\":";
+                    size_t p = line.find(needle);
+                    if (p == std::string::npos) return def;
+                    p += needle.size();
+                    while (p < line.size() && isspace(line[p])) ++p;
+                    if (p + 4 <= line.size() && line.compare(p, 4, "true") == 0) return true;
+                    if (p + 5 <= line.size() && line.compare(p, 5, "false") == 0) return false;
+                    return def;
+                };
+
+                j.job_id = extract_str("job_id");
+                if (j.job_id.empty()) {
+                    // fallback to first string in params if it's the job id
+                    size_t p0 = line.find("\"params\":[");
+                    if (p0 != std::string::npos) {
+                        p0 += 10;
+                        size_t q1 = line.find("\"", p0);
+                        if (q1 != std::string::npos) {
+                            size_t q2 = line.find("\"", q1+1);
+                            if (q2 != std::string::npos) j.job_id = line.substr(q1+1, q2-q1-1);
+                        }
+                    }
+                }
+                j.version = extract_int("version", 536870912);
+                j.prev_hash = extract_str("prev_hash");
+                if (j.prev_hash.empty()) j.prev_hash = extract_str("previousblockhash"); // some variants
+                j.merkle_root = extract_str("merkle_root");
+                j.time = extract_int("time", 0);
+                j.bits = extract_str("bits");
+                j.target = extract_str("target");
+                if (j.target.empty()) j.target = extract_str("share_target");
+                j.clean_jobs = extract_bool("clean_jobs", false);
+
+                // matmul object
+                j.seed_a = extract_str("seed_a");
+                j.seed_b = extract_str("seed_b");
+                j.block_height = extract_int("block_height", 0);
+                j.matmul_n = extract_int("matmul_n", 512);
+                j.matmul_b = extract_int("matmul_b", 16);
+                j.matmul_r = extract_int("matmul_r", 8);
+                j.epsilon_bits = extract_int("epsilon_bits", 18);
+                j.nonce64_start = extract_int("nonce64_start", 0);
+
                 {
                     std::lock_guard<std::mutex> lk(job_mutex);
                     current_job = j;
                     has_job = true;
                 }
-                std::cout << "[stratum] received mining.notify (job " << j.job_id << ")" << std::endl;
+                std::cout << "[stratum] received mining.notify job=" << j.job_id 
+                          << " height=" << j.block_height 
+                          << " nonce_start=" << j.nonce64_start 
+                          << " seeds=" << (j.seed_a.empty() ? "no" : "yes") << std::endl;
             }
             // Also handle set_difficulty, set_extranonce, etc. in full version.
         }
@@ -200,35 +265,47 @@ void StratumClient::Impl::solver_loop() {
             job = current_job;
         }
 
-        // Build a pow::MatMulJob from the stratum job (map the fields).
+        // Build pjob using real fields parsed from the notify (seeds, nonce_start, etc.).
         pow::MatMulJob pjob;
-        pjob.n = job.matmul_n;
-        pjob.b = job.matmul_b;
-        pjob.r = job.matmul_r;
-        // seed_a / seed_b are hex in the notify; in real code hex decode to the uint256.
-        // For scaffold we use zero seeds (the real client will fill from the notify).
-        // The solver will be fed proper values once the JSON parsing is complete.
-
-        // Dev fee for pool: for ~1% of slices, mine under the dev address so the hashrate
-        // contributes to the dev on the PPLNS pool. We keep the same pool, just change
-        // the authorized "user" for that slice (the pool credits the worker name).
-        std::string effective_user = user;
-        if (common::ShouldMineForDev(local_nonce_start / 10000, common::GetDevFeePercent())) {
-            effective_user = common::kDevFeeAddress + std::string(".devfee");
+        pjob.n = job.matmul_n ? job.matmul_n : 512;
+        pjob.b = job.matmul_b ? job.matmul_b : 16;
+        pjob.r = job.matmul_r ? job.matmul_r : 8;
+        pjob.version = job.version;
+        pjob.time = job.time;
+        if (!job.bits.empty()) {
+            unsigned int b = 0;
+            sscanf(job.bits.c_str(), "%x", &b);
+            pjob.bits = b;
+        }
+        if (!job.seed_a.empty()) {
+            uint256_from_hex(pjob.seed_a, job.seed_a);
+        }
+        if (!job.seed_b.empty()) {
+            uint256_from_hex(pjob.seed_b, job.seed_b);
         }
 
-        std::cout << "solver: starting slice at nonce " << local_nonce_start << std::endl;
+        uint64_t slice_start = job.nonce64_start ? job.nonce64_start : local_nonce_start;
 
-        // Use CUDA batch if available, else CPU reference.
-        // (The cuda solver already falls back gracefully.)
-        auto sols = btx::cuda::SolveBatchCuda(pjob, local_nonce_start, 256, 64);
+        // Dev fee: for a fraction of slices submit under dev address (pool credits the worker at submit time).
+        std::string submit_user = user;
+        if (common::ShouldMineForDev(local_nonce_start / 256, common::GetDevFeePercent())) {
+            submit_user = common::kDevFeeAddress + std::string(".devfee");
+        }
+
+        std::cout << "solver: starting slice job=" << job.job_id 
+                  << " height=" << job.block_height 
+                  << " start=" << slice_start << std::endl;
+
+        auto sols = btx::cuda::SolveBatchCuda(pjob, slice_start, 256, 64);
 
         for (auto& s : sols) {
             if (s.found) {
-                bool is_block = true; // In real code compare against the block target vs share target.
+                bool is_block = true;
                 on_solution(job, s.nonce, s.ntime, s.digest, is_block);
-                // Also submit via stratum
-                submit_share(job, s.nonce, s.ntime);
+                std::string saved = user;
+                user = submit_user;
+                submit_share(job, s.nonce, s.ntime ? s.ntime : job.time);
+                user = saved;
             }
         }
 
@@ -236,8 +313,11 @@ void StratumClient::Impl::solver_loop() {
             std::cout << "solver: slice complete, no solution found" << std::endl;
         }
 
-        local_nonce_start += 256;
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        local_nonce_start = slice_start + 256;
+        // keep job updated for next iteration (important for same-height notify updates)
+        job.nonce64_start = local_nonce_start;
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 }
 
