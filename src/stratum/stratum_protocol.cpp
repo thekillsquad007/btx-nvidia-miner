@@ -368,6 +368,8 @@ bool StratumJobToPowJob(const StratumJob& job, pow::MatMulJob& out)
     out.version = job.version;
     out.time = job.time;
     out.nonce_start = job.nonce64_start;
+    out.block_height = job.block_height;
+    out.epsilon_bits = job.epsilon_bits > 0 ? static_cast<uint32_t>(job.epsilon_bits) : 0;
 
     if (!job.bits.empty()) {
         unsigned int b = 0;

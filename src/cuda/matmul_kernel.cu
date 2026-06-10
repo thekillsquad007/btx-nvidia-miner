@@ -29,11 +29,13 @@ struct CudaJobParams {
     uint32_t n;
     uint32_t b;
     uint32_t r;
+    uint32_t epsilon_bits;
     uint8_t prev_hash[32];
     uint8_t merkle_root[32];
     uint8_t seed_a[32];
     uint8_t seed_b[32];
     uint8_t target[32];
+    uint8_t pre_hash_target[32];
 };
 
 struct Sha256State {
@@ -532,9 +534,19 @@ __device__ bool d_solve_nonce(
     __shared__ uint8_t s_seed_fr[32];
     __shared__ Sha256State s_hasher;
     __shared__ bool s_hit;
+    __shared__ bool s_sigma_pass;
 
     if (threadIdx.x == 0) {
         d_derive_sigma(job, nonce64, s_sigma);
+        s_sigma_pass = job.epsilon_bits == 0 ||
+                       d_below_target(s_sigma, job.pre_hash_target);
+    }
+    __syncthreads();
+    if (!s_sigma_pass) {
+        return false;
+    }
+
+    if (threadIdx.x == 0) {
         d_derive_noise_seed("matmul_noise_EL_v1", s_sigma, s_seed_el);
         d_derive_noise_seed("matmul_noise_ER_v1", s_sigma, s_seed_er);
         d_derive_noise_seed("matmul_noise_FL_v1", s_sigma, s_seed_fl);
@@ -853,14 +865,19 @@ CudaJobParams MakeCudaJobParams(const btx::pow::MatMulJob& job, const std::vecto
     p.n = job.n;
     p.b = job.b;
     p.r = job.r;
+    p.epsilon_bits = job.epsilon_bits;
     std::memcpy(p.prev_hash, job.prev_hash.data(), 32);
     std::memcpy(p.merkle_root, job.merkle_root.data(), 32);
     std::memcpy(p.seed_a, job.seed_a.data(), 32);
     std::memcpy(p.seed_b, job.seed_b.data(), 32);
-    if (target.size() == 32) {
-        std::memcpy(p.target, target.data(), 32);
-    } else if (job.target.size() == 32) {
-        std::memcpy(p.target, job.target.data(), 32);
+    const std::vector<uint8_t>& use_target =
+        target.size() == 32 ? target : job.target;
+    if (use_target.size() == 32) {
+        std::memcpy(p.target, use_target.data(), 32);
+        const auto pre_hash = btx::pow::PreHashTargetFromShareTarget(use_target, job.epsilon_bits);
+        if (pre_hash.size() == 32) {
+            std::memcpy(p.pre_hash_target, pre_hash.data(), 32);
+        }
     }
     return p;
 }

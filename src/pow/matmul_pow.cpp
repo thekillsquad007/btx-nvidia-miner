@@ -113,9 +113,89 @@ static bool IsBelowTarget(const uint8_t digest[32], const std::vector<uint8_t>& 
     return true;
 }
 
+static bool IsZero256(const uint8_t value[32])
+{
+    for (int i = 0; i < 32; ++i) {
+        if (value[i] != 0) return false;
+    }
+    return true;
+}
+
+static void WriteLE32(uint8_t* p, uint32_t v)
+{
+    p[0] = static_cast<uint8_t>(v & 0xff);
+    p[1] = static_cast<uint8_t>((v >> 8) & 0xff);
+    p[2] = static_cast<uint8_t>((v >> 16) & 0xff);
+    p[3] = static_cast<uint8_t>((v >> 24) & 0xff);
+}
+
+static void SetMaxArith256(uint8_t out[32])
+{
+    for (int i = 0; i < 8; ++i) {
+        WriteLE32(out + i * 4, 0xffffffffU);
+    }
+}
+
+static bool GetBit256(const uint8_t value[32], unsigned bit)
+{
+    return ((value[bit / 8] >> (bit % 8)) & 1U) != 0;
+}
+
+static bool WouldOverflowLeftShift256(const uint8_t value[32], unsigned shift_bits)
+{
+    if (shift_bits >= 256) {
+        return !IsZero256(value);
+    }
+    for (unsigned bit = 256U - shift_bits; bit < 256U; ++bit) {
+        if (GetBit256(value, bit)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void ShiftLeft256(const uint8_t in[32], uint8_t out[32], unsigned shift_bits)
+{
+    std::memset(out, 0, 32);
+    if (shift_bits >= 256) {
+        return;
+    }
+    for (unsigned out_bit = 0; out_bit < 256U; ++out_bit) {
+        const int in_bit = static_cast<int>(out_bit) - static_cast<int>(shift_bits);
+        if (in_bit >= 0 && GetBit256(in, static_cast<unsigned>(in_bit))) {
+            out[out_bit / 8] |= static_cast<uint8_t>(1U << (out_bit % 8));
+        }
+    }
+}
+
+static std::vector<uint8_t> SaturatingShiftTargetLeft(const std::vector<uint8_t>& target,
+                                                      uint32_t shift_bits)
+{
+    if (target.size() != 32 || shift_bits == 0) {
+        return target;
+    }
+    std::vector<uint8_t> out(32);
+    if (IsZero256(target.data())) {
+        std::memcpy(out.data(), target.data(), 32);
+        return out;
+    }
+    if (shift_bits >= 256 || WouldOverflowLeftShift256(target.data(), shift_bits)) {
+        SetMaxArith256(out.data());
+        return out;
+    }
+    ShiftLeft256(target.data(), out.data(), shift_bits);
+    return out;
+}
+
 } // namespace
 
 // Public API -----------------------------------------------------------------
+
+std::vector<uint8_t> PreHashTargetFromShareTarget(const std::vector<uint8_t>& target,
+                                                  uint32_t epsilon_bits)
+{
+    return SaturatingShiftTargetLeft(target, epsilon_bits);
+}
 
 bool DigestMeetsTarget(const uint256& digest, const std::vector<uint8_t>& target)
 {
@@ -129,6 +209,13 @@ bool VerifySolution(const MatMulJob& job, uint64_t nonce, uint32_t ntime, uint25
     auto sigma_bytes = DeriveSigmaBytes(job.version, job.prev_hash, job.merkle_root,
                                         ntime ? ntime : job.time, job.bits, nonce,
                                         dim, job.seed_a, job.seed_b);
+
+    if (job.epsilon_bits > 0) {
+        const auto pre_hash_target = PreHashTargetFromShareTarget(job.target, job.epsilon_bits);
+        if (!IsBelowTarget(sigma_bytes.data(), pre_hash_target)) {
+            return false;
+        }
+    }
 
     // Build sigma uint256 for FromSeed / noise (the PRFs expect the byte layout we use in ToCanonical)
     uint256 sigma = MakeUint256(sigma_bytes);

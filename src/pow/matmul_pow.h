@@ -26,7 +26,12 @@ struct MatMulJob {
     uint32_t time = 0;
     uint32_t bits = 0;           // compact bits for the *block* (important for sigma)
     uint64_t nonce_start = 0;    // where to begin scanning in this slice
+    uint32_t block_height = 0;
+    uint32_t epsilon_bits = 0;   // pre-hash sigma gate: sigma must be <= target << N
 };
+
+// Saturating left-shift of a 32-byte arith_uint256 target (matches btx SaturatingLeftShift256).
+std::vector<uint8_t> PreHashTargetFromShareTarget(const std::vector<uint8_t>& target, uint32_t epsilon_bits);
 
 // Result of a solve attempt.
 struct MatMulSolution {

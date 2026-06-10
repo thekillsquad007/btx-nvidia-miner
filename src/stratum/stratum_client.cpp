@@ -199,7 +199,7 @@ void StratumClient::Impl::begin_session()
     // Reader owns the socket for the full session.
     reader_thread = std::thread(&Impl::reader_loop, this);
 
-    std::string sub = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"btx-nvidia-miner/0.2.8\",{\"protocol_compliant\":[\"pre_hash_block_tier_v18\"]}]}\n";
+    std::string sub = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"btx-nvidia-miner/0.2.9\",{\"protocol_compliant\":[\"pre_hash_block_tier_v18\"]}]}\n";
     send_line(sub);
     LogLine("[stratum] sent mining.subscribe");
 
