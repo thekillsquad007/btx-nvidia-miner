@@ -15,9 +15,10 @@ struct MatMulJob {
     uint32_t r = 8;
     uint256 seed_a;
     uint256 seed_b;
-    // Difficulty target for the transcript hash (256-bit BE or as interpreted by node).
-    // For solo this is the block target; for pool it can be a share target (easier).
-    std::vector<uint8_t> target; // 32 bytes, big-endian comparison
+    // Share difficulty from pool notify (digest must be <= this).
+    std::vector<uint8_t> target;
+    // Block target derived from header nBits — used only for the pre-hash sigma gate.
+    std::vector<uint8_t> block_target;
 
     // Extra context needed for sigma derivation (header fields)
     int32_t version = 1;
@@ -31,7 +32,7 @@ struct MatMulJob {
 };
 
 // Saturating left-shift of a 32-byte arith_uint256 target (matches btx SaturatingLeftShift256).
-std::vector<uint8_t> PreHashTargetFromShareTarget(const std::vector<uint8_t>& target, uint32_t epsilon_bits);
+std::vector<uint8_t> PreHashTargetShift(const std::vector<uint8_t>& target, uint32_t epsilon_bits);
 
 // Result of a solve attempt.
 struct MatMulSolution {

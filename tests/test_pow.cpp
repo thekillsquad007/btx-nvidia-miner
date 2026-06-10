@@ -84,7 +84,7 @@ static void test_pre_hash_target_shift()
 {
     std::vector<uint8_t> easy;
     assert(btx::stratum::TargetFromHex("00ff", easy));
-    const auto pre = btx::pow::PreHashTargetFromShareTarget(easy, 8);
+    const auto pre = btx::pow::PreHashTargetShift(easy, 8);
     assert(pre.size() == 32);
     assert(pre[0] == 0x00);
     assert(pre[1] == 0xff);
@@ -99,6 +99,8 @@ static void test_live_job_no_false_positives()
     btx::pow::MatMulJob pjob;
     assert(btx::stratum::StratumJobToPowJob(job, pjob));
     assert(pjob.epsilon_bits == 18u);
+    assert(pjob.block_target.size() == 32);
+    assert(pjob.target != pjob.block_target);
 
     int hits = 0;
     for (int i = 0; i < 256; ++i) {

@@ -383,7 +383,13 @@ bool StratumJobToPowJob(const StratumJob& job, pow::MatMulJob& out)
     uint256_from_hex(out.merkle_root, job.merkle_root);
 
     if (!TargetFromHex(job.target, out.target)) return false;
-    return out.target.size() == 32;
+    if (out.target.size() != 32) return false;
+
+    out.block_target.clear();
+    if (!job.bits.empty()) {
+        BlockTargetFromBits(job.bits, out.block_target);
+    }
+    return true;
 }
 
 bool ParsePoolUrl(const std::string& url, std::string& host, uint16_t& port)

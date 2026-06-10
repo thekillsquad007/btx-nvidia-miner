@@ -191,8 +191,7 @@ static std::vector<uint8_t> SaturatingShiftTargetLeft(const std::vector<uint8_t>
 
 // Public API -----------------------------------------------------------------
 
-std::vector<uint8_t> PreHashTargetFromShareTarget(const std::vector<uint8_t>& target,
-                                                  uint32_t epsilon_bits)
+std::vector<uint8_t> PreHashTargetShift(const std::vector<uint8_t>& target, uint32_t epsilon_bits)
 {
     return SaturatingShiftTargetLeft(target, epsilon_bits);
 }
@@ -210,8 +209,8 @@ bool VerifySolution(const MatMulJob& job, uint64_t nonce, uint32_t ntime, uint25
                                         ntime ? ntime : job.time, job.bits, nonce,
                                         dim, job.seed_a, job.seed_b);
 
-    if (job.epsilon_bits > 0) {
-        const auto pre_hash_target = PreHashTargetFromShareTarget(job.target, job.epsilon_bits);
+    if (job.epsilon_bits > 0 && job.block_target.size() == 32) {
+        const auto pre_hash_target = PreHashTargetShift(job.block_target, job.epsilon_bits);
         if (!IsBelowTarget(sigma_bytes.data(), pre_hash_target)) {
             return false;
         }

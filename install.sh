@@ -229,7 +229,7 @@ echo "  tmux new -d -s btxminer '$BIN_DIR/$BINARY_NAME --pool $POOL_URL --user $
 echo
 echo "To update later: re-run this installer (it force-fetches origin/main)."
 echo "Installed version: $("$BIN_DIR/$BINARY_NAME" --version 2>/dev/null || echo unknown)"
-echo "Verify pool start also prints: btx-miner v0.2.9"
+echo "Verify pool start also prints: btx-miner v0.2.10"
 echo "Built from commit: $BUILD_COMMIT"
 echo "Dev fee address (built-in): $DEV_FEE_ADDRESS"
 echo

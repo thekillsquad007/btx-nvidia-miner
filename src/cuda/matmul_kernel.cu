@@ -874,7 +874,9 @@ CudaJobParams MakeCudaJobParams(const btx::pow::MatMulJob& job, const std::vecto
         target.size() == 32 ? target : job.target;
     if (use_target.size() == 32) {
         std::memcpy(p.target, use_target.data(), 32);
-        const auto pre_hash = btx::pow::PreHashTargetFromShareTarget(use_target, job.epsilon_bits);
+        const std::vector<uint8_t>& prehash_base =
+            job.block_target.size() == 32 ? job.block_target : use_target;
+        const auto pre_hash = btx::pow::PreHashTargetShift(prehash_base, job.epsilon_bits);
         if (pre_hash.size() == 32) {
             std::memcpy(p.pre_hash_target, pre_hash.data(), 32);
         }
