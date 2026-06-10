@@ -199,7 +199,7 @@ void StratumClient::Impl::begin_session()
     // Reader owns the socket for the full session.
     reader_thread = std::thread(&Impl::reader_loop, this);
 
-    std::string sub = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"btx-nvidia-miner/0.2.7\",{\"protocol_compliant\":[\"pre_hash_block_tier_v18\"]}]}\n";
+    std::string sub = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"btx-nvidia-miner/0.2.8\",{\"protocol_compliant\":[\"pre_hash_block_tier_v18\"]}]}\n";
     send_line(sub);
     LogLine("[stratum] sent mining.subscribe");
 
@@ -393,23 +393,13 @@ void StratumClient::Impl::solver_loop() {
             job = current_job;
         }
 
-        pow::MatMulJob pjob;
-        if (!StratumJobToPowJob(job, pjob)) {
-            std::cerr << "[stratum] incomplete job " << job.job_id
-                      << " (missing seeds/target/header fields)" << std::endl;
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            continue;
-        }
-
-        std::vector<uint8_t> block_target;
-        const bool have_block_target = BlockTargetFromBits(job.bits, block_target);
-
         uint64_t slice_start = 0;
         {
             std::lock_guard<std::mutex> lk(job_mutex);
             slice_start = local_nonce_cursor ? local_nonce_cursor : job.nonce64_start;
         }
         const int slice = config.nonces_per_slice;
+        const int chunk = config.job_chunk_size > 0 ? config.job_chunk_size : 32;
 
         std::string submit_user = user;
         if (common::ShouldMineForDev(slices_processed, common::GetDevFeePercent())) {
@@ -422,42 +412,67 @@ void StratumClient::Impl::solver_loop() {
         slice_in_progress.store(true);
 
         const auto t0 = std::chrono::steady_clock::now();
-        auto sols = btx::cuda::SolveBatchCuda(pjob, slice_start, slice, config.max_batch_size);
+        uint64_t cursor = slice_start;
+        const uint64_t slice_end = slice_start + static_cast<uint64_t>(slice);
+        int found_count = 0;
+
+        while (cursor < slice_end) {
+            const int this_chunk = static_cast<int>(
+                std::min<uint64_t>(static_cast<uint64_t>(chunk), slice_end - cursor));
+
+            StratumJob snap;
+            {
+                std::lock_guard<std::mutex> lk(job_mutex);
+                snap = current_job;
+            }
+
+            pow::MatMulJob pjob;
+            if (!StratumJobToPowJob(snap, pjob)) {
+                std::cerr << "[stratum] incomplete job " << snap.job_id
+                          << " (missing seeds/target/header fields)" << std::endl;
+                break;
+            }
+
+            std::vector<uint8_t> block_target;
+            const bool have_block_target = BlockTargetFromBits(snap.bits, block_target);
+
+            auto sols = btx::cuda::SolveBatchCuda(pjob, cursor, this_chunk, config.max_batch_size);
+            cursor += static_cast<uint64_t>(this_chunk);
+
+            for (auto& s : sols) {
+                if (!s.found) continue;
+
+                const uint32_t submit_ntime = s.ntime ? s.ntime : snap.time;
+                uint256 verify_digest;
+                if (!pow::VerifySolution(pjob, s.nonce, submit_ntime, verify_digest) ||
+                    !pow::DigestMeetsTarget(verify_digest, pjob.target)) {
+                    continue;
+                }
+
+                ++found_count;
+                const bool is_block = have_block_target &&
+                                      pow::DigestMeetsTarget(verify_digest, block_target);
+                on_solution(snap, s.nonce, submit_ntime, verify_digest, is_block);
+                std::string saved = user;
+                user = submit_user;
+                submit_share(snap, s.nonce, submit_ntime);
+                user = saved;
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(job_mutex);
+                local_nonce_cursor = cursor;
+                if (has_job && current_job.prev_hash == snap.prev_hash) {
+                    current_job.nonce64_start = cursor;
+                }
+            }
+        }
+
         const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
-
         slice_in_progress.store(false);
 
-        uint64_t next_nonce = slice_start + static_cast<uint64_t>(slice);
-        int found_count = 0;
-        for (auto& s : sols) {
-            if (!s.found) continue;
-
-            const uint32_t submit_ntime = s.ntime ? s.ntime : job.time;
-            uint256 verify_digest;
-            if (!pow::VerifySolution(pjob, s.nonce, submit_ntime, verify_digest) ||
-                !pow::DigestMeetsTarget(verify_digest, pjob.target)) {
-                continue;
-            }
-
-            ++found_count;
-            const bool is_block = have_block_target &&
-                                  pow::DigestMeetsTarget(verify_digest, block_target);
-            on_solution(job, s.nonce, submit_ntime, verify_digest, is_block);
-            std::string saved = user;
-            user = submit_user;
-            submit_share(job, s.nonce, submit_ntime);
-            user = saved;
-            if (s.nonce >= next_nonce) next_nonce = s.nonce + 1;
-        }
-
-        {
-            std::lock_guard<std::mutex> lk(job_mutex);
-            local_nonce_cursor = next_nonce;
-            if (has_job && current_job.prev_hash == job.prev_hash) {
-                current_job.nonce64_start = next_nonce;
-            }
-        }
+        const uint64_t next_nonce = cursor;
 
         ++slices_processed;
         const double nps = slice > 0 ? (1000.0 * slice / std::max<int64_t>(elapsed_ms, 1)) : 0.0;

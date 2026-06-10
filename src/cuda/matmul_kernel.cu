@@ -20,6 +20,7 @@
 namespace {
 
 constexpr uint32_t kFieldModulus = 0x7FFFFFFFU;
+constexpr int kBlockThreads = 256;
 
 struct CudaJobParams {
     int32_t version;
@@ -375,19 +376,26 @@ __device__ void d_derive_sigma(const CudaJobParams& job, uint64_t nonce64, uint8
 
 __device__ void d_fill_rect(uint32_t* out, uint32_t rows, uint32_t cols, const uint8_t* seed_internal)
 {
-    for (uint32_t r = 0; r < rows; ++r) {
-        for (uint32_t c = 0; c < cols; ++c) {
-            out[r * cols + c] = d_from_oracle(seed_internal, r * cols + c);
-        }
+    const uint32_t total = rows * cols;
+    for (uint32_t idx = threadIdx.x; idx < total; idx += blockDim.x) {
+        out[idx] = d_from_oracle(seed_internal, idx);
+    }
+}
+
+__device__ void d_zero_u32(uint32_t* out, uint32_t count)
+{
+    for (uint32_t i = threadIdx.x; i < count; i += blockDim.x) {
+        out[i] = 0;
     }
 }
 
 __device__ void d_mat_get(const uint32_t* m, uint32_t n, uint32_t row, uint32_t col, uint32_t* out, uint32_t bsz)
 {
-    for (uint32_t r = 0; r < bsz; ++r) {
-        for (uint32_t c = 0; c < bsz; ++c) {
-            out[r * bsz + c] = m[(row + r) * n + (col + c)];
-        }
+    const uint32_t cells = bsz * bsz;
+    for (uint32_t idx = threadIdx.x; idx < cells; idx += blockDim.x) {
+        const uint32_t r = idx / bsz;
+        const uint32_t c = idx % bsz;
+        out[idx] = m[(row + r) * n + (col + c)];
     }
 }
 
@@ -402,40 +410,51 @@ __device__ void d_block_lowrank(
     uint32_t col0,
     uint32_t bsz)
 {
-    for (uint32_t i = 0; i < bsz * bsz; ++i) {
-        out[i] = 0;
-    }
-    for (uint32_t i = 0; i < bsz; ++i) {
-        for (uint32_t j = 0; j < bsz; ++j) {
-            uint32_t acc = 0;
-            for (uint32_t k = 0; k < l_cols; ++k) {
-                const uint32_t a = L[(row0 + i) * l_cols + k];
-                const uint32_t b = R[k * r_cols + (col0 + j)];
-                acc = d_add(acc, d_mul(a, b));
-            }
-            out[i * bsz + j] = acc;
+    (void)l_rows;
+    const uint32_t cells = bsz * bsz;
+    for (uint32_t idx = threadIdx.x; idx < cells; idx += blockDim.x) {
+        const uint32_t i = idx / bsz;
+        const uint32_t j = idx % bsz;
+        uint32_t acc = 0;
+        for (uint32_t k = 0; k < l_cols; ++k) {
+            const uint32_t a = L[(row0 + i) * l_cols + k];
+            const uint32_t b = R[k * r_cols + (col0 + j)];
+            acc = d_add(acc, d_mul(a, b));
         }
+        out[idx] = acc;
     }
 }
 
 __device__ void d_block_matmul(uint32_t* out, const uint32_t* A, const uint32_t* B, uint32_t bsz)
 {
-    for (uint32_t i = 0; i < bsz; ++i) {
-        for (uint32_t j = 0; j < bsz; ++j) {
-            uint32_t acc = 0;
-            for (uint32_t k = 0; k < bsz; ++k) {
-                acc = d_add(acc, d_mul(A[i * bsz + k], B[k * bsz + j]));
-            }
-            out[i * bsz + j] = acc;
+    const uint32_t cells = bsz * bsz;
+    for (uint32_t idx = threadIdx.x; idx < cells; idx += blockDim.x) {
+        const uint32_t i = idx / bsz;
+        const uint32_t j = idx % bsz;
+        uint32_t acc = 0;
+        for (uint32_t k = 0; k < bsz; ++k) {
+            acc = d_add(acc, d_mul(A[i * bsz + k], B[k * bsz + j]));
         }
+        out[idx] = acc;
     }
 }
 
 __device__ void d_add_block(uint32_t* dst, const uint32_t* src, uint32_t bsz)
 {
     const uint32_t n = bsz * bsz;
-    for (uint32_t i = 0; i < n; ++i) {
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
         dst[i] = d_add(dst[i], src[i]);
+    }
+}
+
+__device__ void d_write_c_block(uint32_t* C, uint32_t job_n, uint32_t row0, uint32_t col0,
+                                const uint32_t* cblk, uint32_t bsz)
+{
+    const uint32_t cells = bsz * bsz;
+    for (uint32_t idx = threadIdx.x; idx < cells; idx += blockDim.x) {
+        const uint32_t x = idx / bsz;
+        const uint32_t y = idx % bsz;
+        C[(row0 + x) * job_n + (col0 + y)] = cblk[idx];
     }
 }
 
@@ -462,25 +481,29 @@ __device__ bool d_below_target(const uint8_t digest[32], const uint8_t target[32
 
 __device__ void d_build_compress_vec(const uint8_t* sigma_internal, uint32_t bsz, uint32_t* compress_v)
 {
-    uint8_t sigma_canonical[32];
-    d_to_canonical(sigma_internal, sigma_canonical);
+    __shared__ uint8_t s_seed_internal[32];
 
-    Sha256State st;
-    d_sha256_init(&st);
-    const char* tag = "matmul-compress-v1";
-    d_sha256_update(&st, reinterpret_cast<const uint8_t*>(tag), 18);
-    d_sha256_update(&st, sigma_canonical, 32);
-    uint8_t seedb[32];
-    d_sha256_final(&st, seedb);
+    if (threadIdx.x == 0) {
+        uint8_t sigma_canonical[32];
+        d_to_canonical(sigma_internal, sigma_canonical);
 
-    uint8_t seed_internal[32];
-    for (int i = 0; i < 32; ++i) {
-        seed_internal[i] = seedb[31 - i];
+        Sha256State st;
+        d_sha256_init(&st);
+        const char* tag = "matmul-compress-v1";
+        d_sha256_update(&st, reinterpret_cast<const uint8_t*>(tag), 18);
+        d_sha256_update(&st, sigma_canonical, 32);
+        uint8_t seedb[32];
+        d_sha256_final(&st, seedb);
+
+        for (int i = 0; i < 32; ++i) {
+            s_seed_internal[i] = seedb[31 - i];
+        }
     }
+    __syncthreads();
 
-    const uint64_t len = static_cast<uint64_t>(bsz) * bsz;
-    for (uint64_t k = 0; k < len; ++k) {
-        compress_v[k] = d_from_oracle(seed_internal, static_cast<uint32_t>(k));
+    const uint32_t len = bsz * bsz;
+    for (uint32_t k = threadIdx.x; k < len; k += blockDim.x) {
+        compress_v[k] = d_from_oracle(s_seed_internal, k);
     }
 }
 
@@ -502,81 +525,107 @@ __device__ bool d_solve_nonce(
     uint32_t* cblk,
     uint8_t* digest_out)
 {
-    uint8_t sigma_internal[32];
-    d_derive_sigma(job, nonce64, sigma_internal);
+    __shared__ uint8_t s_sigma[32];
+    __shared__ uint8_t s_seed_el[32];
+    __shared__ uint8_t s_seed_er[32];
+    __shared__ uint8_t s_seed_fl[32];
+    __shared__ uint8_t s_seed_fr[32];
+    __shared__ Sha256State s_hasher;
+    __shared__ bool s_hit;
 
-    uint8_t seed_el[32];
-    uint8_t seed_er[32];
-    uint8_t seed_fl[32];
-    uint8_t seed_fr[32];
-    d_derive_noise_seed("matmul_noise_EL_v1", sigma_internal, seed_el);
-    d_derive_noise_seed("matmul_noise_ER_v1", sigma_internal, seed_er);
-    d_derive_noise_seed("matmul_noise_FL_v1", sigma_internal, seed_fl);
-    d_derive_noise_seed("matmul_noise_FR_v1", sigma_internal, seed_fr);
+    if (threadIdx.x == 0) {
+        d_derive_sigma(job, nonce64, s_sigma);
+        d_derive_noise_seed("matmul_noise_EL_v1", s_sigma, s_seed_el);
+        d_derive_noise_seed("matmul_noise_ER_v1", s_sigma, s_seed_er);
+        d_derive_noise_seed("matmul_noise_FL_v1", s_sigma, s_seed_fl);
+        d_derive_noise_seed("matmul_noise_FR_v1", s_sigma, s_seed_fr);
+    }
+    __syncthreads();
 
-    d_fill_rect(E_L, job.n, job.r, seed_el);
-    d_fill_rect(E_R, job.r, job.n, seed_er);
-    d_fill_rect(F_L, job.n, job.r, seed_fl);
-    d_fill_rect(F_R, job.r, job.n, seed_fr);
+    d_fill_rect(E_L, job.n, job.r, s_seed_el);
+    __syncthreads();
+    d_fill_rect(E_R, job.r, job.n, s_seed_er);
+    __syncthreads();
+    d_fill_rect(F_L, job.n, job.r, s_seed_fl);
+    __syncthreads();
+    d_fill_rect(F_R, job.r, job.n, s_seed_fr);
+    __syncthreads();
 
     const uint32_t nn = job.n * job.n;
-    for (uint32_t i = 0; i < nn; ++i) {
-        C[i] = 0;
-    }
+    d_zero_u32(C, nn);
+    __syncthreads();
 
-    d_build_compress_vec(sigma_internal, job.b, compress_v);
+    d_build_compress_vec(s_sigma, job.b, compress_v);
+    __syncthreads();
 
     const uint32_t bsz = job.b;
     const uint32_t N = job.n / bsz;
+    const uint32_t total_steps = N * N * N;
 
-    Sha256State hasher;
-    d_sha256_init(&hasher);
+    if (threadIdx.x == 0) {
+        d_sha256_init(&s_hasher);
+    }
+    __syncthreads();
 
-    for (uint32_t bi = 0; bi < N; ++bi) {
+    // Flat step loop: all threads share the same (bi,bj,ell) each iteration.
+    for (uint32_t step = 0; step < total_steps; ++step) {
+        const uint32_t bi = step / (N * N);
+        const uint32_t rem = step % (N * N);
+        const uint32_t bj = rem / N;
+        const uint32_t ell = rem % N;
         const uint32_t row0 = bi * bsz;
-        for (uint32_t bj = 0; bj < N; ++bj) {
-            const uint32_t col0 = bj * bsz;
-            for (uint32_t ell = 0; ell < N; ++ell) {
-                const uint32_t mid0 = ell * bsz;
+        const uint32_t col0 = bj * bsz;
+        const uint32_t mid0 = ell * bsz;
 
-                d_mat_get(A, job.n, row0, mid0, ablk, bsz);
-                d_block_lowrank(noise_blk, E_L, E_R, job.n, job.r, job.n, row0, mid0, bsz);
-                d_add_block(ablk, noise_blk, bsz);
+        d_mat_get(A, job.n, row0, mid0, ablk, bsz);
+        __syncthreads();
+        d_block_lowrank(noise_blk, E_L, E_R, job.n, job.r, job.n, row0, mid0, bsz);
+        __syncthreads();
+        d_add_block(ablk, noise_blk, bsz);
+        __syncthreads();
 
-                d_mat_get(B, job.n, mid0, col0, bblk, bsz);
-                d_block_lowrank(noise_blk, F_L, F_R, job.n, job.r, job.n, mid0, col0, bsz);
-                d_add_block(bblk, noise_blk, bsz);
+        d_mat_get(B, job.n, mid0, col0, bblk, bsz);
+        __syncthreads();
+        d_block_lowrank(noise_blk, F_L, F_R, job.n, job.r, job.n, mid0, col0, bsz);
+        __syncthreads();
+        d_add_block(bblk, noise_blk, bsz);
+        __syncthreads();
 
-                d_block_matmul(prod, ablk, bblk, bsz);
+        d_block_matmul(prod, ablk, bblk, bsz);
+        __syncthreads();
 
-                d_mat_get(C, job.n, row0, col0, cblk, bsz);
-                d_add_block(cblk, prod, bsz);
-                for (uint32_t x = 0; x < bsz; ++x) {
-                    for (uint32_t y = 0; y < bsz; ++y) {
-                        C[(row0 + x) * job.n + (col0 + y)] = cblk[x * bsz + y];
-                    }
-                }
+        d_mat_get(C, job.n, row0, col0, cblk, bsz);
+        __syncthreads();
+        d_add_block(cblk, prod, bsz);
+        __syncthreads();
+        d_write_c_block(C, job.n, row0, col0, cblk, bsz);
+        __syncthreads();
 
-                const uint32_t comp = d_dot(cblk, compress_v, bsz * bsz);
-                uint8_t le[4] = {
-                    static_cast<uint8_t>(comp & 0xff),
-                    static_cast<uint8_t>((comp >> 8) & 0xff),
-                    static_cast<uint8_t>((comp >> 16) & 0xff),
-                    static_cast<uint8_t>((comp >> 24) & 0xff),
-                };
-                d_sha256_update(&hasher, le, 4);
-            }
+        if (threadIdx.x == 0) {
+            const uint32_t comp = d_dot(cblk, compress_v, bsz * bsz);
+            uint8_t le[4] = {
+                static_cast<uint8_t>(comp & 0xff),
+                static_cast<uint8_t>((comp >> 8) & 0xff),
+                static_cast<uint8_t>((comp >> 16) & 0xff),
+                static_cast<uint8_t>((comp >> 24) & 0xff),
+            };
+            d_sha256_update(&s_hasher, le, 4);
         }
+        __syncthreads();
     }
 
-    uint8_t inner[32];
-    d_sha256_final(&hasher, inner);
+    if (threadIdx.x == 0) {
+        uint8_t inner[32];
+        d_sha256_final(&s_hasher, inner);
 
-    Sha256State outer;
-    d_sha256_init(&outer);
-    d_sha256_update(&outer, inner, 32);
-    d_sha256_final(&outer, digest_out);
-    return d_below_target(digest_out, job.target);
+        Sha256State outer;
+        d_sha256_init(&outer);
+        d_sha256_update(&outer, inner, 32);
+        d_sha256_final(&outer, digest_out);
+        s_hit = d_below_target(digest_out, job.target);
+    }
+    __syncthreads();
+    return s_hit;
 }
 
 __global__ void matmul_nonce_kernel(
@@ -632,11 +681,13 @@ __global__ void matmul_nonce_kernel(
         params, A, B, nonces[idx], C, E_L, E_R, F_L, F_R, compress_v,
         ablk, bblk, noise_blk, prod, cblk, digest);
 
-    if (hit) {
-        out_found[idx] = 1;
-    }
-    for (int i = 0; i < 32; ++i) {
-        out_digests[idx * 32 + i] = digest[i];
+    if (threadIdx.x == 0) {
+        if (hit) {
+            out_found[idx] = 1;
+        }
+        for (int i = 0; i < 32; ++i) {
+            out_digests[idx * 32 + i] = digest[i];
+        }
     }
 }
 
@@ -650,6 +701,71 @@ struct DeviceMatrixCache {
 };
 
 DeviceMatrixCache g_matrix_cache[16];
+
+struct DeviceLaunchPool {
+    int device = -1;
+    uint64_t* d_nonces = nullptr;
+    uint32_t* d_workspace = nullptr;
+    uint8_t* d_digests = nullptr;
+    uint8_t* d_found = nullptr;
+    size_t nonce_cap = 0;
+    size_t ws_bytes = 0;
+    size_t digest_cap = 0;
+};
+
+DeviceLaunchPool g_launch_pool[16];
+
+void FreeLaunchPool(DeviceLaunchPool& pool)
+{
+    if (pool.d_nonces) cudaFree(pool.d_nonces);
+    if (pool.d_workspace) cudaFree(pool.d_workspace);
+    if (pool.d_digests) cudaFree(pool.d_digests);
+    if (pool.d_found) cudaFree(pool.d_found);
+    pool = {};
+}
+
+bool EnsureLaunchPool(int device, size_t batch, size_t ws_bytes)
+{
+    if (device < 0 || device >= 16) return false;
+    DeviceLaunchPool& pool = g_launch_pool[device];
+    if (pool.device != device) {
+        FreeLaunchPool(pool);
+        pool.device = device;
+    }
+
+    if (pool.nonce_cap < batch) {
+        if (pool.d_nonces) cudaFree(pool.d_nonces);
+        pool.d_nonces = nullptr;
+        if (cudaMalloc(&pool.d_nonces, batch * sizeof(uint64_t)) != cudaSuccess) {
+            FreeLaunchPool(pool);
+            return false;
+        }
+        pool.nonce_cap = batch;
+    }
+    if (pool.ws_bytes < ws_bytes) {
+        if (pool.d_workspace) cudaFree(pool.d_workspace);
+        pool.d_workspace = nullptr;
+        if (cudaMalloc(&pool.d_workspace, ws_bytes) != cudaSuccess) {
+            FreeLaunchPool(pool);
+            return false;
+        }
+        pool.ws_bytes = ws_bytes;
+    }
+    const size_t digest_bytes = batch * 32;
+    if (pool.digest_cap < batch) {
+        if (pool.d_digests) cudaFree(pool.d_digests);
+        if (pool.d_found) cudaFree(pool.d_found);
+        pool.d_digests = nullptr;
+        pool.d_found = nullptr;
+        if (cudaMalloc(&pool.d_digests, digest_bytes) != cudaSuccess ||
+            cudaMalloc(&pool.d_found, batch) != cudaSuccess) {
+            FreeLaunchPool(pool);
+            return false;
+        }
+        pool.digest_cap = batch;
+    }
+    return pool.d_nonces && pool.d_workspace && pool.d_digests && pool.d_found;
+}
 
 void FreeMatrixCache(DeviceMatrixCache& cache)
 {
@@ -783,11 +899,6 @@ extern "C" bool LaunchMatMulTranscriptBatch(
 
     CudaJobParams h_params = MakeCudaJobParams(job, target);
 
-    uint64_t* d_nonces = nullptr;
-    uint32_t* d_workspace = nullptr;
-    uint8_t* d_digests = nullptr;
-    uint8_t* d_found = nullptr;
-
     const size_t batch = nonces.size();
     const size_t ws_uint32_per_nonce = WorkspaceUint32Count(job.n, job.r, job.b);
     const size_t ws_bytes = batch * ws_uint32_per_nonce * sizeof(uint32_t);
@@ -795,57 +906,42 @@ extern "C" bool LaunchMatMulTranscriptBatch(
     out_digests.resize(batch);
     out_found.assign(batch, false);
 
-    bool ok = false;
+    if (!EnsureLaunchPool(device, batch, ws_bytes)) {
+        return false;
+    }
+    DeviceLaunchPool& pool = g_launch_pool[device];
+
     std::vector<uint8_t> h_found(batch, 0);
     std::vector<uint8_t> h_digests(batch * 32);
 
-    if (cudaMalloc(&d_nonces, batch * sizeof(uint64_t)) != cudaSuccess) {
-        goto cleanup;
+    if (cudaMemset(pool.d_found, 0, batch) != cudaSuccess) {
+        return false;
     }
-    if (cudaMalloc(&d_workspace, ws_bytes) != cudaSuccess) {
-        goto cleanup;
-    }
-    if (cudaMalloc(&d_digests, batch * 32) != cudaSuccess) {
-        goto cleanup;
-    }
-    if (cudaMalloc(&d_found, batch) != cudaSuccess) {
-        goto cleanup;
-    }
-    if (cudaMemset(d_found, 0, batch) != cudaSuccess) {
-        goto cleanup;
-    }
-    if (cudaMemcpy(d_nonces, nonces.data(), batch * sizeof(uint64_t), cudaMemcpyHostToDevice) != cudaSuccess) {
-        goto cleanup;
+    if (cudaMemcpy(pool.d_nonces, nonces.data(), batch * sizeof(uint64_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+        return false;
     }
 
-    matmul_nonce_kernel<<<static_cast<int>(batch), 1>>>(
-        h_params, d_A, d_B, d_nonces, d_workspace, d_digests, d_found);
+    matmul_nonce_kernel<<<static_cast<int>(batch), kBlockThreads>>>(
+        h_params, d_A, d_B, pool.d_nonces, pool.d_workspace, pool.d_digests, pool.d_found);
 
     if (cudaGetLastError() != cudaSuccess) {
-        goto cleanup;
+        return false;
     }
     if (cudaDeviceSynchronize() != cudaSuccess) {
-        goto cleanup;
+        return false;
     }
-    if (cudaMemcpy(h_found.data(), d_found, batch, cudaMemcpyDeviceToHost) != cudaSuccess) {
-        goto cleanup;
+    if (cudaMemcpy(h_found.data(), pool.d_found, batch, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        return false;
     }
-    if (cudaMemcpy(h_digests.data(), d_digests, batch * 32, cudaMemcpyDeviceToHost) != cudaSuccess) {
-        goto cleanup;
+    if (cudaMemcpy(h_digests.data(), pool.d_digests, batch * 32, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        return false;
     }
 
     for (size_t i = 0; i < batch; ++i) {
         std::memcpy(out_digests[i].data(), h_digests.data() + i * 32, 32);
         out_found[i] = h_found[i] != 0;
     }
-    ok = true;
-
-cleanup:
-    if (d_nonces) cudaFree(d_nonces);
-    if (d_workspace) cudaFree(d_workspace);
-    if (d_digests) cudaFree(d_digests);
-    if (d_found) cudaFree(d_found);
-    return ok;
+    return true;
 }
 
 extern "C" bool CudaVerifyAgainstCpu(

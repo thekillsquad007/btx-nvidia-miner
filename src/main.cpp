@@ -3,7 +3,7 @@
 #include <string>
 
 // Bump when making pool/stratum fixes so rigs can verify they got the latest build.
-static constexpr const char* kMinerVersion = "0.2.7";
+static constexpr const char* kMinerVersion = "0.2.8";
 
 #include "cuda/cuda_device.h"
 #include "cuda/cuda_solver.h"
@@ -28,8 +28,8 @@ Common:
   --user <worker>           Full worker name for pool (address.worker) — required
   --pass <password>         Pool password (default: x)
   --devices 0,1,2|all       GPUs to use (default: all visible)
-  --intensity <n>           Nonces per work slice (default: 256)
-  --batch <n>               CUDA/CPU batch size per launch (default: 64)
+  --intensity <n>           Nonces per work slice (default: 512)
+  --batch <n>               CUDA nonces per kernel launch (default: 128)
   --verbose                 Extra stratum debug logging
   --benchmark               Run a short throughput test (CPU ref + CUDA if available)
   --no-gpu                  Force CPU reference path only
@@ -98,8 +98,8 @@ int main(int argc, char** argv)
     bool do_bench = false;
     bool force_cpu = false;
     bool verbose = false;
-    int intensity = 256;
-    int batch = 64;
+    int intensity = 512;
+    int batch = 128;
     float dev_fee_override = -1.0f;
     std::string devices_spec = "all";
 
@@ -210,8 +210,8 @@ int main(int argc, char** argv)
         };
 
         btx::stratum::StratumConfig cfg;
-        cfg.nonces_per_slice = intensity > 0 ? intensity : 256;
-        cfg.max_batch_size = batch > 0 ? batch : 64;
+        cfg.nonces_per_slice = intensity > 0 ? intensity : 512;
+        cfg.max_batch_size = batch > 0 ? batch : 128;
         cfg.verbose = verbose;
 
         btx::stratum::StratumClient client(host, port, user, pass, on_sol, false, cfg);
