@@ -177,6 +177,7 @@ cd build
 echo "Configuring (CUDA enabled)..."
 cmake -DCMAKE_BUILD_TYPE=Release \
       -DBTX_MINER_ENABLE_CUDA=ON \
+      -DCUDA_ARCHS="86;89;90" \
       ..
 
 echo "Building (this can take a while on first build)..."
