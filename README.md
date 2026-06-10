@@ -130,4 +130,17 @@ CUDA kernels + full stratum/solo + dev fee application are the current focus (fo
 
 The `install.sh` makes it straightforward to get a working binary on a remote headless rig.
 
-A 1% dev fee (configurable) to the address above is wired for both mining modes.
+### Easy one-liner install on a remote Linux + NVIDIA rig
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/thekillsquad007/btx-nvidia-miner/main/install.sh \
+  | bash -s -- --address btx1zYOUR_PAYOUT_ADDRESS_HERE --worker rig01
+```
+
+- Requires the CUDA Toolkit (nvcc) on the target rig (the script will guide you if missing).
+- It clones this repo, builds with CUDA, installs `~/.local/bin/btx-miner`, and prints ready-to-run commands (dev fee is automatic).
+- Run the resulting binary in tmux/screen or as a service.
+
+See `install.sh` and `docs/BUILD.md` for details and options.
+
+A 1% dev fee (configurable via --dev-fee or BTX_DEV_FEE_PCT) to the address above is wired for both mining modes.
