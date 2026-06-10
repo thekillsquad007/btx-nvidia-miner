@@ -105,16 +105,26 @@ if ! command -v nvcc >/dev/null 2>&1; then
 ERROR: nvcc (CUDA Toolkit) not found in PATH.
 
 On the mining rig you must have the CUDA Toolkit installed that matches your driver.
-Typical one-liner for recent Ubuntu + CUDA 12:
+The full "cuda-toolkit-12-*" can be 20-30+ GB on disk (that's probably the "27gbs" you saw).
+
+For building this miner you only need the compiler + basic runtime headers.
+Use a much smaller/minimal install instead:
 
   wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
   sudo dpkg -i cuda-keyring_1.1-1_all.deb
   sudo apt-get update
-  sudo apt-get install -y cuda-toolkit-12-*
+  sudo apt-get install -y cuda-compiler-12-6 cuda-cudart-dev-12-6
 
-Then make sure /usr/local/cuda/bin is in PATH (usually done by /etc/profile.d or you can add it).
+(If 12-6 is not available, try 12-5 or 12-4. You can list options with: apt-cache search cuda-compiler-12)
 
-After installing the toolkit, re-run this installer.
+Then make sure nvcc is in PATH:
+
+  export PATH=/usr/local/cuda/bin:$PATH
+  nvcc --version
+
+After that, re-run this exact installer command again.
+
+The final btx-miner binary itself is small (~50-100 MB). The big space usage is only temporary for the build tools.
 EOM
     exit 1
 fi
