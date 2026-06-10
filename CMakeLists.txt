@@ -168,8 +168,21 @@ if(BTX_MINER_BUILD_TESTS)
         target_compile_definitions(btx-miner-test PRIVATE HAVE_OPENSSL=1)
     endif()
 
+    add_executable(btx-miner-oracle-test
+        tests/test_oracle_digest.cpp
+        ${POW_SOURCES}
+        src/stratum/stratum_protocol.cpp
+    )
+    target_include_directories(btx-miner-oracle-test PRIVATE src include)
+    target_link_libraries(btx-miner-oracle-test PRIVATE Threads::Threads)
+    if(OpenSSL_FOUND)
+        target_link_libraries(btx-miner-oracle-test PRIVATE OpenSSL::Crypto)
+        target_compile_definitions(btx-miner-oracle-test PRIVATE HAVE_OPENSSL=1)
+    endif()
+
     enable_testing()
     add_test(NAME pow_reference COMMAND btx-miner-test)
+    add_test(NAME oracle_digest COMMAND btx-miner-oracle-test)
 
     if(BTX_MINER_ENABLE_CUDA)
         add_executable(btx-miner-cuda-test

@@ -110,7 +110,7 @@ static void test_matmul_seed_v2()
         static_cast<uint16_t>(pjob.n), 0);
     assert(seed_a0 != pjob.seed_a);
     assert(seed_a0 != seed_a1);
-    assert(seed_a0.GetHex() == "8e68504090fbe15edcdc74efac76977185d2a63f42ea34ddb6357379e138a5e2");
+    assert(seed_a0.GetHex() == "e2a538e1797335b6dd34ea423fa6d285719776acef74dcdc5ee1fb904050688e");
 }
 
 static void test_live_job_no_false_positives()

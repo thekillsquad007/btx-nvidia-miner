@@ -142,11 +142,15 @@ Element from_oracle(const uint256& seed, uint32_t index)
         uint8_t hash[32];
         sha256_final(&st, hash);
 
-        const uint32_t candidate = (uint32_t)hash[0] | ((uint32_t)hash[1]<<8) | ((uint32_t)hash[2]<<16) | ((uint32_t)hash[3]<<24);
-        if ((candidate & MODULUS) == candidate) {   // already < 2^31-1 if high bit clear, but we mask anyway
-            return candidate & MODULUS;
+        const uint32_t candidate =
+            (static_cast<uint32_t>(hash[0])) |
+            (static_cast<uint32_t>(hash[1]) << 8) |
+            (static_cast<uint32_t>(hash[2]) << 16) |
+            (static_cast<uint32_t>(hash[3]) << 24);
+        const uint32_t masked = candidate & MODULUS;
+        if (masked < MODULUS) {
+            return masked;
         }
-        if (candidate < MODULUS) return candidate;
     }
 
     // Fallback (extremely rare)
@@ -159,7 +163,11 @@ Element from_oracle(const uint256& seed, uint32_t index)
     sha256_update(&fb, (const uint8_t*)tag, 15);
     uint8_t fbh[32];
     sha256_final(&fb, fbh);
-    uint32_t v = (uint32_t)fbh[0] | ((uint32_t)fbh[1]<<8) | ((uint32_t)fbh[2]<<16) | ((uint32_t)fbh[3]<<24);
+    const uint32_t v =
+        (static_cast<uint32_t>(fbh[0])) |
+        (static_cast<uint32_t>(fbh[1]) << 8) |
+        (static_cast<uint32_t>(fbh[2]) << 16) |
+        (static_cast<uint32_t>(fbh[3]) << 24);
     return v % MODULUS;
 }
 

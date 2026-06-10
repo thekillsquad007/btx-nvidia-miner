@@ -284,11 +284,9 @@ __device__ uint32_t d_from_oracle(const uint8_t* seed_internal, uint32_t index)
                                    (static_cast<uint32_t>(hash[1]) << 8) |
                                    (static_cast<uint32_t>(hash[2]) << 16) |
                                    (static_cast<uint32_t>(hash[3]) << 24);
-        if ((candidate & kFieldModulus) == candidate) {
-            return candidate & kFieldModulus;
-        }
-        if (candidate < kFieldModulus) {
-            return candidate;
+        const uint32_t masked = candidate & kFieldModulus;
+        if (masked < kFieldModulus) {
+            return masked;
         }
     }
 
