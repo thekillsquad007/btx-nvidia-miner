@@ -43,6 +43,10 @@ struct StratumClient::Impl {
     int extranonce2_size = 4;
     uint64_t submit_id = 1;
 
+    // Stats for observability (like in AMD reference)
+    int shares_submitted = 0;
+    int slices_processed = 0;
+
     void connect_and_handshake();
     void reader_loop();
     void solver_loop();
@@ -245,7 +249,9 @@ void StratumClient::Impl::reader_loop() {
                 std::cout << "[stratum] received mining.notify job=" << j.job_id 
                           << " height=" << j.block_height 
                           << " nonce_start=" << j.nonce64_start 
-                          << " seeds=" << (j.seed_a.empty() ? "no" : "yes") << std::endl;
+                          << " seeds=" << (j.seed_a.empty() ? "no" : "yes") 
+                          << " target=" << (j.target.empty() ? j.share_target : j.target).substr(0,16) << "..." 
+                          << std::endl << std::flush;
             }
             // Also handle set_difficulty, set_extranonce, etc. in full version.
         }
@@ -259,13 +265,20 @@ void StratumClient::Impl::solver_loop() {
         {
             std::lock_guard<std::mutex> lk(job_mutex);
             if (!has_job) {
+                static int wait_count = 0;
+                if (++wait_count % 50 == 0) {
+                    std::cout << "solver_loop: waiting for job (has_job=false)" << std::endl << std::flush;
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
                 continue;
             }
             job = current_job;
         }
 
-        std::cout << "solver_loop: has_job true, processing job " << job.job_id << std::endl;
+        std::cout << "solver_loop: has_job true, processing job " << job.job_id 
+                  << " height=" << job.block_height 
+                  << " nonce64_start=" << job.nonce64_start 
+                  << std::endl << std::flush;
 
         // Build pjob using real fields parsed from the notify (seeds, nonce_start, etc.).
         pow::MatMulJob pjob;
@@ -290,13 +303,17 @@ void StratumClient::Impl::solver_loop() {
 
         // Dev fee: for a fraction of slices submit under dev address (pool credits the worker at submit time).
         std::string submit_user = user;
-        if (common::ShouldMineForDev(local_nonce_start / 8, common::GetDevFeePercent())) {
+        bool is_dev_fee = common::ShouldMineForDev(local_nonce_start / 8, common::GetDevFeePercent());
+        if (is_dev_fee) {
             submit_user = common::kDevFeeAddress + std::string(".devfee");
         }
+        std::cout << "solver: dev_fee_active=" << (is_dev_fee ? "yes" : "no") << " submit_as=" << submit_user << std::endl << std::flush;
 
         std::cout << "solver: starting slice job=" << job.job_id 
                   << " height=" << job.block_height 
-                  << " start=" << slice_start << std::endl;
+                  << " start=" << slice_start 
+                  << " (dev_fee_slice=" << (common::ShouldMineForDev(local_nonce_start / 8, common::GetDevFeePercent()) ? "yes" : "no") << ")"
+                  << std::endl << std::flush;
 
         auto sols = btx::cuda::SolveBatchCuda(pjob, slice_start, 8, 8);
 
@@ -312,7 +329,17 @@ void StratumClient::Impl::solver_loop() {
         }
 
         if (sols.empty()) {
-            std::cout << "solver: slice complete, no solution found" << std::endl;
+            std::cout << "solver: slice complete, no solution found" << std::endl << std::flush;
+        } else {
+            std::cout << "solver: slice complete, found " << sols.size() << " solution(s)" << std::endl << std::flush;
+        }
+
+        slices_processed++;
+        if (slices_processed % 20 == 0) {
+            std::cout << "solver: STATS slices=" << slices_processed 
+                      << " shares_submitted=" << shares_submitted 
+                      << " current_nonce=" << local_nonce_start 
+                      << std::endl << std::flush;
         }
 
         local_nonce_start = slice_start + 8;
@@ -331,7 +358,9 @@ void StratumClient::Impl::submit_share(const StratumJob& job, uint64_t nonce, ui
        << std::hex << ntime << "\",\""
        << std::hex << nonce << "\"]}\n";
     send_line(ss.str());
-    std::cout << "[stratum] submitted share nonce=" << nonce << std::endl;
+    shares_submitted++;
+    std::cout << "[stratum] submitted share nonce=" << nonce << " for job=" << job.job_id << " ntime=" << ntime 
+              << " (total_submitted=" << shares_submitted << ")" << std::endl << std::flush;
 }
 
 } // namespace stratum
