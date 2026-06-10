@@ -34,3 +34,7 @@ private:
 };
 
 inline uint256 uint256S(const char* hex); // simple parser in .cpp
+
+namespace btx {
+using uint256 = ::uint256;
+}

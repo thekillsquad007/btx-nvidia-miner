@@ -7,6 +7,8 @@
 // Multi-GPU and better on-device noise coming in follow-ups.
 
 #include "cuda/cuda_solver.h"
+#include "pow/matmul_pow.h"
+#include "pow/uint256_stub.h"
 
 #ifdef __CUDACC__
 
