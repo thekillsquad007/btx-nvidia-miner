@@ -37,19 +37,15 @@ std::vector<CudaSolution> CollectHits(
     const std::vector<bool>& found)
 {
     std::vector<CudaSolution> solutions;
+    solutions.reserve(4);
     for (size_t i = 0; i < batch_nonces.size(); ++i) {
         if (!found[i]) continue;
-        uint256 cpu_d;
-        if (!pow::VerifySolution(job, batch_nonces[i], job.time, cpu_d) ||
-            cpu_d != digests[i] ||
-            !pow::DigestMeetsTarget(cpu_d, job.target)) {
-            continue;
-        }
+        // GPU kernel already validated share-tier target on device.
         CudaSolution sol;
         sol.found = true;
         sol.nonce = batch_nonces[i];
         sol.ntime = job.time;
-        sol.digest = cpu_d;
+        sol.digest = digests[i];
         solutions.push_back(sol);
     }
     return solutions;

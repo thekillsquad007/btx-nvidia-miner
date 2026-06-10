@@ -1,7 +1,10 @@
 #include "stratum/stratum_client.h"
 
 #include "common/dev_fee.h"
+#include "common/hardware.h"
+#include "common/version.h"
 #include "cuda/cuda_solver.h"
+#include "cuda/cuda_device.h"
 #include "cuda/hashrate.h"
 #include "stratum/stratum_protocol.h"
 
@@ -20,6 +23,7 @@
 #include <iomanip>
 #include <iostream>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -28,6 +32,9 @@ namespace btx {
 namespace stratum {
 
 namespace {
+
+constexpr double kMetricsReportIntervalSec = 60.0;
+
 void LogLine(const std::string& msg)
 {
     std::cout << msg << std::endl << std::flush;
@@ -57,8 +64,13 @@ struct StratumClient::Impl {
     int sock = -1;
     std::thread reader_thread;
     std::thread solver_thread;
+    std::thread metrics_thread;
+
+    std::string session_id;
+    std::string operator_label;
 
     std::mutex job_mutex;
+    std::mutex send_mutex;
     StratumJob current_job;
     bool has_job = false;
 
@@ -87,7 +99,9 @@ struct StratumClient::Impl {
     void begin_session();
     void reader_loop();
     void solver_loop();
+    void metrics_loop();
     void dispatch_line(const std::string& line);
+    void handle_set_canonical_name(const std::string& line);
     bool recv_line_blocking(std::string& line);
     void send_line(const std::string& line);
     void handle_notify(const StratumJob& incoming);
@@ -157,6 +171,7 @@ void StratumClient::Impl::join_session_threads()
     handshake_cv.notify_all();
     if (reader_thread.joinable()) reader_thread.join();
     if (solver_thread.joinable()) solver_thread.join();
+    if (metrics_thread.joinable()) metrics_thread.join();
 }
 
 void StratumClient::Impl::reset_session_state()
@@ -209,9 +224,26 @@ void StratumClient::Impl::begin_session()
     // Reader owns the socket for the full session.
     reader_thread = std::thread(&Impl::reader_loop, this);
 
-    std::string sub = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"btx-nvidia-miner/0.2.14\",{\"protocol_compliant\":[\"pre_hash_block_tier_v18\"]}]}\n";
-    send_line(sub);
-    LogLine("[stratum] sent mining.subscribe");
+    session_id = common::GenerateSessionId();
+    operator_label = common::ExtractOperatorLabel(user);
+    const std::string hw_json = common::BuildStaticHardwareJson(
+        common::kMinerVersion, btx::cuda::GetActiveDevices());
+    const std::string user_agent =
+        std::string("btx-nvidia-miner/") + common::kMinerVersion;
+
+    std::ostringstream sub_ss;
+    sub_ss << "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":["
+           << "\"" << common::JsonEscape(user_agent) << "\","
+           << "{"
+           << "\"protocol_compliant\":[\"pre_hash_block_tier_v18\"],"
+           << "\"hardware\":" << hw_json << ","
+           << "\"operator_label\":\"" << common::JsonEscape(operator_label) << "\","
+           << "\"session_id\":\"" << common::JsonEscape(session_id) << "\""
+           << "}]}\n";
+    send_line(sub_ss.str());
+    LogLine("[stratum] sent mining.subscribe session=" + session_id.substr(0, 8) +
+            " operator=" + operator_label);
+    LogLine("[stratum] hardware: " + common::HardwareSummaryFromJson(hw_json));
 
     {
         std::unique_lock<std::mutex> lk(handshake_mutex);
@@ -236,6 +268,7 @@ void StratumClient::Impl::begin_session()
 
     // Start mining immediately after subscribe — don't block on authorize.
     solver_thread = std::thread(&Impl::solver_loop, this);
+    metrics_thread = std::thread(&Impl::metrics_loop, this);
     LogLine("[stratum] solver started");
 
     std::string auth = "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" + user + "\",\"" + pass + "\"]}\n";
@@ -260,6 +293,7 @@ void StratumClient::Impl::begin_session()
 
 void StratumClient::Impl::send_line(const std::string& line) {
     if (sock < 0) return;
+    std::lock_guard<std::mutex> lk(send_mutex);
     ssize_t sent = send(sock, line.data(), line.size(), 0);
     if (sent < 0) {
         throw std::runtime_error("send failed");
@@ -309,6 +343,16 @@ void StratumClient::Impl::dispatch_line(const std::string& line)
         return;
     }
 
+    if (line.find("mining.set_canonical_name") != std::string::npos) {
+        handle_set_canonical_name(line);
+        return;
+    }
+
+    if (line.find("mining.set_difficulty") != std::string::npos) {
+        log("[stratum] difficulty update: " + line.substr(0, 200));
+        return;
+    }
+
     if (IsMiningNotifyLine(line)) {
         StratumJob j;
         if (ParseNotifyLine(line, j)) {
@@ -336,6 +380,76 @@ void StratumClient::Impl::dispatch_line(const std::string& line)
                     " rejected=" + std::to_string(shares_rejected) + ")");
         }
         break;
+    }
+}
+
+void StratumClient::Impl::handle_set_canonical_name(const std::string& line)
+{
+    std::vector<CanonicalNameAssignment> items;
+    if (!ParseSetCanonicalNameLine(line, items)) {
+        LogLine("[stratum] set_canonical_name: could not parse params");
+        return;
+    }
+
+    for (const auto& item : items) {
+        std::ostringstream msg;
+        msg << "[stratum] canonical worker: " << item.canonical_name;
+        if (!item.gpu_uuid.empty()) {
+            msg << " gpu=" << item.gpu_uuid;
+        }
+        LogLine(msg.str());
+        LogLine("[stratum] dashboard: https://pool.minebtx.com/");
+    }
+}
+
+void StratumClient::Impl::metrics_loop()
+{
+    std::mt19937 rng(static_cast<unsigned>(
+        std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::uniform_real_distribution<double> stagger(5.0, kMetricsReportIntervalSec);
+    const auto initial_ms = static_cast<int>(stagger(rng) * 1000.0);
+
+    auto sleep_until = [&](std::chrono::steady_clock::time_point deadline) {
+        while (running) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) return;
+            std::this_thread::sleep_for(std::min(
+                std::chrono::milliseconds(250),
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)));
+        }
+    };
+
+    sleep_until(std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(initial_ms));
+
+    while (running) {
+        try {
+            double solver_nps = 0.0;
+            for (const auto& sample : btx::cuda::GetGpuHashrateSnapshot()) {
+                solver_nps += sample.average_nonces_per_sec;
+            }
+            if (solver_nps <= 0.0) {
+                for (const auto& sample : btx::cuda::GetGpuHashrateSnapshot()) {
+                    solver_nps += sample.slice_nonces_per_sec;
+                }
+            }
+
+            const int shares_total = shares_submitted;
+            const std::string payload = common::BuildRuntimeMetricsJson(
+                session_id, solver_nps, shares_total);
+
+            std::ostringstream msg;
+            msg << "{\"method\":\"worker.report_metrics\",\"params\":[" << payload << "]}\n";
+            send_line(msg.str());
+            log("[stratum] sent worker.report_metrics nps=" +
+                std::to_string(static_cast<int>(solver_nps)));
+        } catch (const std::exception& e) {
+            log(std::string("[stratum] metrics report failed (non-fatal): ") + e.what());
+        }
+
+        sleep_until(std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(static_cast<int>(
+                        kMetricsReportIntervalSec * 1000.0)));
     }
 }
 
@@ -408,27 +522,50 @@ void StratumClient::Impl::solver_loop() {
             std::lock_guard<std::mutex> lk(job_mutex);
             slice_start = local_nonce_cursor ? local_nonce_cursor : job.nonce64_start;
         }
-        const int slice = config.nonces_per_slice;
-        const int chunk = config.job_chunk_size > 0 ? config.job_chunk_size : 32;
+
+        const int chunk = config.job_chunk_size > 0
+            ? config.job_chunk_size
+            : config.max_batch_size;
+        const uint64_t slice_cap = static_cast<uint64_t>(
+            std::max(config.nonces_per_slice, chunk));
+        const auto slice_deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(static_cast<int>(
+                std::max(config.slice_max_seconds, 0.5) * 1000.0));
 
         std::string submit_user = user;
         if (common::ShouldMineForDev(slices_processed, common::GetDevFeePercent())) {
             submit_user = std::string(common::kDevFeeAddress) + ".devfee";
         }
 
-        LogLine("[stratum] slice starting job=" + job.job_id +
-                " start=" + std::to_string(slice_start) +
-                " count=" + std::to_string(slice));
+        if (config.verbose || slices_processed % 20 == 0) {
+            LogLine("[stratum] slice starting job=" + job.job_id +
+                    " start=" + std::to_string(slice_start) +
+                    " batch=" + std::to_string(config.max_batch_size) +
+                    " max_sec=" + std::to_string(config.slice_max_seconds));
+        }
         slice_in_progress.store(true);
 
         const auto t0 = std::chrono::steady_clock::now();
         uint64_t cursor = slice_start;
-        const uint64_t slice_end = slice_start + static_cast<uint64_t>(slice);
+        const uint64_t slice_end = slice_start + slice_cap;
         int found_count = 0;
+        uint64_t nonces_tried = 0;
 
-        while (cursor < slice_end) {
-            const int this_chunk = static_cast<int>(
-                std::min<uint64_t>(static_cast<uint64_t>(chunk), slice_end - cursor));
+        while (cursor < slice_end && running) {
+            if (std::chrono::steady_clock::now() >= slice_deadline) {
+                break;
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(job_mutex);
+                if (has_job && !current_job.prev_hash.empty() &&
+                    current_job.prev_hash != job.prev_hash) {
+                    break;
+                }
+            }
+
+            const int this_chunk = static_cast<int>(std::min<uint64_t>(
+                static_cast<uint64_t>(chunk), slice_end - cursor));
 
             StratumJob snap;
             {
@@ -448,24 +585,23 @@ void StratumClient::Impl::solver_loop() {
 
             auto sols = btx::cuda::SolveBatchCuda(pjob, cursor, this_chunk, config.max_batch_size);
             cursor += static_cast<uint64_t>(this_chunk);
+            nonces_tried += static_cast<uint64_t>(this_chunk);
 
             for (auto& s : sols) {
                 if (!s.found) continue;
 
                 const uint32_t submit_ntime = s.ntime ? s.ntime : snap.time;
-                uint256 verify_digest;
-                if (!pow::VerifySolution(pjob, s.nonce, submit_ntime, verify_digest) ||
-                    !pow::DigestMeetsTarget(verify_digest, pjob.target)) {
+                if (!pow::DigestMeetsTarget(s.digest, pjob.target)) {
                     continue;
                 }
 
                 ++found_count;
                 const bool is_block = have_block_target &&
-                                      pow::DigestMeetsTarget(verify_digest, block_target);
-                on_solution(snap, s.nonce, submit_ntime, verify_digest, is_block);
+                                      pow::DigestMeetsTarget(s.digest, block_target);
+                on_solution(snap, s.nonce, submit_ntime, s.digest, is_block);
                 std::string saved = user;
                 user = submit_user;
-                submit_share(snap, s.nonce, submit_ntime, verify_digest);
+                submit_share(snap, s.nonce, submit_ntime, s.digest);
                 user = saved;
             }
 
@@ -485,11 +621,13 @@ void StratumClient::Impl::solver_loop() {
         const uint64_t next_nonce = cursor;
 
         ++slices_processed;
-        const double nps = slice > 0 ? (1000.0 * slice / std::max<int64_t>(elapsed_ms, 1)) : 0.0;
+        const double nps = nonces_tried > 0
+            ? (1000.0 * static_cast<double>(nonces_tried) / std::max<int64_t>(elapsed_ms, 1))
+            : 0.0;
         LogLine("[stratum] slice done job=" + job.job_id +
                 " start=" + std::to_string(slice_start) +
                 " end=" + std::to_string(next_nonce) +
-                " tried=" + std::to_string(slice) +
+                " tried=" + std::to_string(nonces_tried) +
                 " found=" + std::to_string(found_count) +
                 " " + std::to_string(static_cast<int>(nps)) + " nonces/s" +
                 " (" + std::to_string(elapsed_ms) + "ms)");

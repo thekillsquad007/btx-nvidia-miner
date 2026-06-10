@@ -73,6 +73,7 @@ set(COMMON_SOURCES
     src/common/work_dispatcher.cpp
     src/common/metrics.cpp
     src/common/dev_fee.cpp
+    src/common/hardware.cpp
 )
 
 set(POW_SOURCES

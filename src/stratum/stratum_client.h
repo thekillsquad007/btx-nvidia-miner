@@ -39,9 +39,10 @@ struct StratumJob {
 using SolutionCallback = std::function<void(const StratumJob& job, uint64_t nonce, uint32_t ntime, const uint256& digest, bool is_block)>;
 
 struct StratumConfig {
-    int nonces_per_slice = 512;
-    int max_batch_size = 128;
-    int job_chunk_size = 32;   // refresh job_id and submit hits every N nonces
+    int nonces_per_slice = 20'000'000;  // safety cap per slice
+    int max_batch_size = 256;           // CUDA nonces per kernel launch
+    int job_chunk_size = 0;             // 0 = use max_batch_size between job refreshes
+    double slice_max_seconds = 5.0;     // time-limit slices (dexbtx-style)
     bool verbose = false;
 };
 

@@ -520,5 +520,55 @@ bool ParseRpcResult(const std::string& line, uint64_t id, bool& ok, std::string&
     return true;
 }
 
+namespace {
+
+bool ExtractJsonStringField(const std::string& obj, const char* key, std::string& out)
+{
+    const std::string needle = std::string("\"") + key + "\":\"";
+    const auto pos = obj.find(needle);
+    if (pos == std::string::npos) return false;
+    const size_t start = pos + needle.size();
+    const size_t end = obj.find('"', start);
+    if (end == std::string::npos) return false;
+    out = obj.substr(start, end - start);
+    return true;
+}
+
+} // namespace
+
+bool ParseSetCanonicalNameLine(const std::string& line, std::vector<CanonicalNameAssignment>& out)
+{
+    out.clear();
+    if (line.find("mining.set_canonical_name") == std::string::npos) {
+        return false;
+    }
+
+    size_t pos = 0;
+    while (true) {
+        const size_t canon_pos = line.find("\"canonical_name\":\"", pos);
+        if (canon_pos == std::string::npos) break;
+
+        size_t obj_start = line.rfind('{', canon_pos);
+        if (obj_start == std::string::npos) obj_start = canon_pos;
+        size_t obj_end = line.find('}', canon_pos);
+        if (obj_end == std::string::npos) obj_end = line.size();
+        const std::string obj = line.substr(obj_start, obj_end - obj_start + 1);
+
+        CanonicalNameAssignment item;
+        if (!ExtractJsonStringField(obj, "canonical_name", item.canonical_name)) {
+            pos = canon_pos + 18;
+            continue;
+        }
+        ExtractJsonStringField(obj, "gpu_uuid", item.gpu_uuid);
+        ExtractJsonStringField(obj, "operator_label", item.operator_label);
+        if (!item.canonical_name.empty()) {
+            out.push_back(item);
+        }
+        pos = obj_end + 1;
+    }
+
+    return !out.empty();
+}
+
 } // namespace stratum
 } // namespace btx

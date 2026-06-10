@@ -2,9 +2,7 @@
 #include <iostream>
 #include <string>
 
-// Bump when making pool/stratum fixes so rigs can verify they got the latest build.
-static constexpr const char* kMinerVersion = "0.2.14";
-
+#include "common/version.h"
 #include "cuda/cuda_device.h"
 #include "cuda/cuda_solver.h"
 #include "cuda/hashrate.h"
@@ -28,8 +26,9 @@ Common:
   --user <worker>           Full worker name for pool (address.worker) — required
   --pass <password>         Pool password (default: x)
   --devices 0,1,2|all       GPUs to use (default: all visible)
-  --intensity <n>           Nonces per work slice (default: 512)
-  --batch <n>               CUDA nonces per kernel launch (default: 128)
+  --intensity <n>           Max nonces per slice safety cap (default: 20000000)
+  --batch <n>               CUDA nonces per kernel launch (default: 256)
+  --slice-seconds <n>       Time-limit each mining slice in seconds (default: 5)
   --verbose                 Extra stratum debug logging
   --benchmark               Run a short throughput test (CPU ref + CUDA if available)
   --no-gpu                  Force CPU reference path only
@@ -98,15 +97,16 @@ int main(int argc, char** argv)
     bool do_bench = false;
     bool force_cpu = false;
     bool verbose = false;
-    int intensity = 512;
-    int batch = 128;
+    int intensity = 20'000'000;
+    int batch = 256;
+    double slice_seconds = 5.0;
     float dev_fee_override = -1.0f;
     std::string devices_spec = "all";
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "-h" || a == "--help") { print_help(); return 0; }
-        if (a == "--version") { std::cout << "btx-miner v" << kMinerVersion << std::endl; return 0; }
+        if (a == "--version") { std::cout << "btx-miner v" << btx::common::kMinerVersion << std::endl; return 0; }
         if (a == "--benchmark") do_bench = true;
         if (a == "--no-gpu") force_cpu = true;
         if (a == "--verbose") verbose = true;
@@ -119,6 +119,7 @@ int main(int argc, char** argv)
         if (a == "--pass" && i+1 < argc) pass = argv[++i];
         if (a == "--intensity" && i+1 < argc) intensity = std::atoi(argv[++i]);
         if (a == "--batch" && i+1 < argc) batch = std::atoi(argv[++i]);
+        if (a == "--slice-seconds" && i+1 < argc) slice_seconds = std::atof(argv[++i]);
         if (a == "--devices" && i+1 < argc) devices_spec = argv[++i];
         if (a == "--dev-fee" && i+1 < argc) dev_fee_override = parse_dev_fee(argv[++i]);
     }
@@ -187,8 +188,9 @@ int main(int argc, char** argv)
             return 1;
         }
 
-        std::cout << "btx-miner v" << kMinerVersion << " — pool mining " << host << ":" << port << " as " << user << std::endl;
-        std::cout << "Intensity=" << intensity << " nonces/slice, batch=" << batch;
+        std::cout << "btx-miner v" << btx::common::kMinerVersion << " — pool mining " << host << ":" << port << " as " << user << std::endl;
+        std::cout << "Slice=" << slice_seconds << "s cap=" << intensity
+                  << " nonces, batch=" << batch;
         if (devices_spec != "all") std::cout << ", devices=" << devices_spec;
         std::cout << std::endl;
         print_gpu_inventory();
@@ -210,8 +212,9 @@ int main(int argc, char** argv)
         };
 
         btx::stratum::StratumConfig cfg;
-        cfg.nonces_per_slice = intensity > 0 ? intensity : 512;
-        cfg.max_batch_size = batch > 0 ? batch : 128;
+        cfg.nonces_per_slice = intensity > 0 ? intensity : 20'000'000;
+        cfg.max_batch_size = batch > 0 ? batch : 256;
+        cfg.slice_max_seconds = slice_seconds > 0.0 ? slice_seconds : 5.0;
         cfg.verbose = verbose;
 
         btx::stratum::StratumClient client(host, port, user, pass, on_sol, false, cfg);

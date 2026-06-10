@@ -24,7 +24,7 @@ std::vector<CudaSolution> SolveBatchCuda(
     const pow::MatMulJob& job,
     uint64_t start_nonce,
     uint64_t max_tries,
-    int max_batch_size = 128  // tune per GPU mem
+    int max_batch_size = 256  // tune per GPU mem
 );
 
 // Usable GPU indices: see cuda_device.h GetUsableDeviceIndices().
