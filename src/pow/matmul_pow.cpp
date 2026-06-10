@@ -42,6 +42,16 @@ static uint256 From32(const uint8_t d[32])
     return uint256(d);
 }
 
+// SHA-256 outputs MSB-first bytes; uint256 / pool targets store MSB at data()[31].
+static uint256 CanonicalBytesToUint256(const uint8_t raw[32])
+{
+    uint256 out;
+    for (int i = 0; i < 32; ++i) {
+        out.data()[i] = raw[31 - i];
+    }
+    return out;
+}
+
 // Corrected version that returns the 32-byte sigma directly for PRF use.
 static std::array<uint8_t, 32> DeriveSigmaBytes(int32_t version,
                                                 const uint256& prev,
@@ -300,7 +310,14 @@ bool SigmaBelowPreHashTarget(const uint8_t sigma[32], const std::vector<uint8_t>
 
 bool DigestMeetsTarget(const uint256& digest, const std::vector<uint8_t>& target)
 {
-    return IsBelowTarget(digest.data(), target);
+    if (target.size() != 32) return false;
+    for (int i = 31; i >= 0; --i) {
+        const uint8_t d = digest.data()[i];
+        const uint8_t t = target[i];
+        if (d < t) return true;
+        if (d > t) return false;
+    }
+    return true;
 }
 
 bool VerifySolution(const MatMulJob& job, uint64_t nonce, uint32_t ntime, uint256& out_digest)
@@ -417,9 +434,9 @@ bool VerifySolution(const MatMulJob& job, uint64_t nonce, uint32_t ntime, uint25
     uint8_t finald[32];
     sha256_final(&outer, finald);
 
-    out_digest = From32(finald);
+    out_digest = CanonicalBytesToUint256(finald);
 
-    return IsBelowTarget(finald, job.target);
+    return DigestMeetsTarget(out_digest, job.target);
 }
 
 MatMulSolution SolveCPU(const MatMulJob& job, uint64_t max_tries, uint32_t ntime)

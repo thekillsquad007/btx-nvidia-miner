@@ -561,21 +561,21 @@ __device__ void d_write_c_block(uint32_t* C, uint32_t job_n, uint32_t row0, uint
     }
 }
 
-__device__ bool d_below_target(const uint8_t digest[32], const uint8_t target[32])
+__device__ void d_canonicalize_sha256(const uint8_t raw[32], uint8_t out[32])
 {
-    for (int i = 7; i >= 0; --i) {
-        const uint32_t d = static_cast<uint32_t>(digest[i * 4]) |
-                           (static_cast<uint32_t>(digest[i * 4 + 1]) << 8) |
-                           (static_cast<uint32_t>(digest[i * 4 + 2]) << 16) |
-                           (static_cast<uint32_t>(digest[i * 4 + 3]) << 24);
-        const uint32_t t = static_cast<uint32_t>(target[i * 4]) |
-                           (static_cast<uint32_t>(target[i * 4 + 1]) << 8) |
-                           (static_cast<uint32_t>(target[i * 4 + 2]) << 16) |
-                           (static_cast<uint32_t>(target[i * 4 + 3]) << 24);
-        if (d < t) {
+    for (int i = 0; i < 32; ++i) {
+        out[i] = raw[31 - i];
+    }
+}
+
+// Match btx Uint256LE / pool share_validator: data[31] is most significant.
+__device__ bool d_uint256_le(const uint8_t digest[32], const uint8_t target[32])
+{
+    for (int i = 31; i >= 0; --i) {
+        if (digest[i] < target[i]) {
             return true;
         }
-        if (d > t) {
+        if (digest[i] > target[i]) {
             return false;
         }
     }
@@ -745,8 +745,10 @@ __device__ bool d_solve_nonce(
         Sha256State outer;
         d_sha256_init(&outer);
         d_sha256_update(&outer, inner, 32);
-        d_sha256_final(&outer, digest_out);
-        s_hit = d_below_target(digest_out, job.target);
+        uint8_t raw_digest[32];
+        d_sha256_final(&outer, raw_digest);
+        d_canonicalize_sha256(raw_digest, digest_out);
+        s_hit = d_uint256_le(digest_out, job.target);
     }
     __syncthreads();
     return s_hit;
