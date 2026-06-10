@@ -3,7 +3,7 @@
 # Easy installer for btx-nvidia-miner on a remote Linux machine with NVIDIA GPU.
 #
 # Usage (recommended one-liner):
-#   curl -fsSL <raw-url-to-this-script> | bash -s -- --address btx1zYOURADDRESS...
+#   curl -fsSL https://raw.githubusercontent.com/thekillsquad007/btx-nvidia-miner/main/install.sh | bash -s -- --address btx1zYOURADDRESS...
 #
 # The script will:
 #   - Install basic build dependencies
@@ -20,7 +20,7 @@ set -euo pipefail
 DEV_FEE_ADDRESS="btx1z0069dewdztkwnrxx97lt9c5paynh0nynegqxq2kgykh0ct8xaggq0953gx"
 DEFAULT_DEV_FEE_PCT="1.0"
 
-REPO_URL="https://github.com/btxchain/btx-nvidia-miner.git"   # Update if you fork
+REPO_URL="https://github.com/thekillsquad007/btx-nvidia-miner.git"   # thekillsquad007's btx-nvidia-miner fork
 BINARY_NAME="btx-miner"
 
 INSTALL_PREFIX="${HOME}/.local"
