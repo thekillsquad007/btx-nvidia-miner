@@ -354,24 +354,15 @@ __device__ void d_derive_sigma(const CudaJobParams& job, uint64_t nonce64, uint8
     const uint16_t dim = static_cast<uint16_t>(job.n);
     uint8_t dm[2] = {static_cast<uint8_t>(dim & 0xff), static_cast<uint8_t>((dim >> 8) & 0xff)};
 
-    uint8_t prev_c[32];
-    uint8_t merkle_c[32];
-    uint8_t sa_c[32];
-    uint8_t sb_c[32];
-    d_to_canonical(job.prev_hash, prev_c);
-    d_to_canonical(job.merkle_root, merkle_c);
-    d_to_canonical(job.seed_a, sa_c);
-    d_to_canonical(job.seed_b, sb_c);
-
     d_sha256_update(&h, ver, 4);
-    d_sha256_update(&h, prev_c, 32);
-    d_sha256_update(&h, merkle_c, 32);
+    d_sha256_update(&h, job.prev_hash, 32);
+    d_sha256_update(&h, job.merkle_root, 32);
     d_sha256_update(&h, t, 4);
     d_sha256_update(&h, bi, 4);
     d_sha256_update(&h, n64, 8);
     d_sha256_update(&h, dm, 2);
-    d_sha256_update(&h, sa_c, 32);
-    d_sha256_update(&h, sb_c, 32);
+    d_sha256_update(&h, job.seed_a, 32);
+    d_sha256_update(&h, job.seed_b, 32);
 
     uint8_t first[32];
     d_sha256_final(&h, first);
@@ -450,11 +441,19 @@ __device__ void d_add_block(uint32_t* dst, const uint32_t* src, uint32_t bsz)
 
 __device__ bool d_below_target(const uint8_t digest[32], const uint8_t target[32])
 {
-    for (int i = 0; i < 32; ++i) {
-        if (digest[i] < target[i]) {
+    for (int i = 7; i >= 0; --i) {
+        const uint32_t d = static_cast<uint32_t>(digest[i * 4]) |
+                           (static_cast<uint32_t>(digest[i * 4 + 1]) << 8) |
+                           (static_cast<uint32_t>(digest[i * 4 + 2]) << 16) |
+                           (static_cast<uint32_t>(digest[i * 4 + 3]) << 24);
+        const uint32_t t = static_cast<uint32_t>(target[i * 4]) |
+                           (static_cast<uint32_t>(target[i * 4 + 1]) << 8) |
+                           (static_cast<uint32_t>(target[i * 4 + 2]) << 16) |
+                           (static_cast<uint32_t>(target[i * 4 + 3]) << 24);
+        if (d < t) {
             return true;
         }
-        if (digest[i] > target[i]) {
+        if (d > t) {
             return false;
         }
     }

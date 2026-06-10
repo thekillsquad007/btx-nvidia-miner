@@ -10,8 +10,8 @@ static void test_target_from_hex()
     std::vector<uint8_t> t;
     assert(btx::stratum::TargetFromHex("00ff", t));
     assert(t.size() == 32);
-    assert(t[30] == 0xff);
-    assert(t[31] == 0x00);
+    assert(t[0] == 0xff);
+    assert(t[1] == 0x00);
 }
 
 static void test_subscribe_not_confused_with_notify()
@@ -57,8 +57,8 @@ static void test_parse_notify()
     assert(btx::stratum::StratumJobToPowJob(job, pjob));
     assert(pjob.n == 512);
     assert(pjob.target.size() == 32);
-    assert(pjob.target[30] == 0xff);
-    assert(pjob.target[31] == 0x00);
+    assert(pjob.target[0] == 0xff);
+    assert(pjob.target[1] == 0x00);
 }
 
 static void test_parse_subscribe()
@@ -78,6 +78,26 @@ static void test_parse_pool_url()
     assert(btx::stratum::ParsePoolUrl("stratum+tcp://stratum.minebtx.com:3333", host, port));
     assert(host == "stratum.minebtx.com");
     assert(port == 3333);
+}
+
+static void test_live_job_no_false_positives()
+{
+    const std::string line = R"({"id":null,"method":"mining.notify","params":["0000000000002c88",536870912,"e41768fe0c8ed2d40b967c981e3af7cddf6fc495f844563836756fa76a0d2ec9","fe14530b149adfa21a45f7d2666f3c2dbef7296333398ba208ab77ea6b44a6e2",1781098511,"1d14bd00","000052f400000000000000000000000000000000000000000000000000000000",true,{"block_height":126655,"epsilon_bits":18,"matmul_b":16,"matmul_n":512,"matmul_r":8,"nonce64_start":26336739459072,"seed_a":"a6f74b5acf03e8b9955f1e8503045f868223e6a21add4bd1d287df4828f232c6","seed_b":"a257d5579fb72a5bbee627db164336b8aea91095af751ddbae91de568da04597"}]})";
+
+    btx::stratum::StratumJob job;
+    assert(btx::stratum::ParseNotifyLine(line, job));
+    btx::pow::MatMulJob pjob;
+    assert(btx::stratum::StratumJobToPowJob(job, pjob));
+
+    int hits = 0;
+    for (int i = 0; i < 256; ++i) {
+        uint256 d;
+        if (btx::pow::VerifySolution(pjob, pjob.nonce_start + static_cast<uint64_t>(i), pjob.time, d) &&
+            btx::pow::DigestMeetsTarget(d, pjob.target)) {
+            ++hits;
+        }
+    }
+    assert(hits == 0);
 }
 
 static void test_pow_smoke()
@@ -101,6 +121,7 @@ int main()
     test_parse_notify();
     test_parse_subscribe();
     test_parse_pool_url();
+    test_live_job_no_false_positives();
     test_pow_smoke();
     std::cout << "All pow/stratum tests passed." << std::endl;
     return 0;

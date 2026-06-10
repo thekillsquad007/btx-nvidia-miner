@@ -16,6 +16,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
@@ -60,6 +61,7 @@ struct StratumClient::Impl {
     std::string extranonce1;
     int extranonce2_size = 4;
     uint64_t submit_id = 3;
+    std::deque<uint64_t> pending_submit_ids;
 
     int shares_submitted = 0;
     int shares_accepted = 0;
@@ -197,7 +199,7 @@ void StratumClient::Impl::begin_session()
     // Reader owns the socket for the full session.
     reader_thread = std::thread(&Impl::reader_loop, this);
 
-    std::string sub = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"btx-nvidia-miner/0.3\",{\"protocol_compliant\":[\"pre_hash_block_tier_v18\"]}]}\n";
+    std::string sub = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"btx-nvidia-miner/0.2.7\",{\"protocol_compliant\":[\"pre_hash_block_tier_v18\"]}]}\n";
     send_line(sub);
     LogLine("[stratum] sent mining.subscribe");
 
@@ -308,7 +310,11 @@ void StratumClient::Impl::dispatch_line(const std::string& line)
         return;
     }
 
-    if (ParseRpcResult(line, submit_id - 1, ok, err)) {
+    for (auto it = pending_submit_ids.begin(); it != pending_submit_ids.end(); ++it) {
+        if (!ParseRpcResult(line, *it, ok, err)) {
+            continue;
+        }
+        pending_submit_ids.erase(it);
         if (ok) {
             ++shares_accepted;
             LogLine("[stratum] share ACCEPTED (accepted=" + std::to_string(shares_accepted) +
@@ -319,6 +325,7 @@ void StratumClient::Impl::dispatch_line(const std::string& line)
                     " (accepted=" + std::to_string(shares_accepted) +
                     " rejected=" + std::to_string(shares_rejected) + ")");
         }
+        break;
     }
 }
 
@@ -394,6 +401,9 @@ void StratumClient::Impl::solver_loop() {
             continue;
         }
 
+        std::vector<uint8_t> block_target;
+        const bool have_block_target = BlockTargetFromBits(job.bits, block_target);
+
         uint64_t slice_start = 0;
         {
             std::lock_guard<std::mutex> lk(job_mutex);
@@ -422,11 +432,21 @@ void StratumClient::Impl::solver_loop() {
         int found_count = 0;
         for (auto& s : sols) {
             if (!s.found) continue;
+
+            const uint32_t submit_ntime = s.ntime ? s.ntime : job.time;
+            uint256 verify_digest;
+            if (!pow::VerifySolution(pjob, s.nonce, submit_ntime, verify_digest) ||
+                !pow::DigestMeetsTarget(verify_digest, pjob.target)) {
+                continue;
+            }
+
             ++found_count;
-            on_solution(job, s.nonce, s.ntime, s.digest, true);
+            const bool is_block = have_block_target &&
+                                  pow::DigestMeetsTarget(verify_digest, block_target);
+            on_solution(job, s.nonce, submit_ntime, verify_digest, is_block);
             std::string saved = user;
             user = submit_user;
-            submit_share(job, s.nonce, s.ntime ? s.ntime : job.time);
+            submit_share(job, s.nonce, submit_ntime);
             user = saved;
             if (s.nonce >= next_nonce) next_nonce = s.nonce + 1;
         }
@@ -462,8 +482,11 @@ void StratumClient::Impl::solver_loop() {
 void StratumClient::Impl::submit_share(const StratumJob& job, uint64_t nonce, uint32_t ntime) {
     std::string extranonce2(static_cast<size_t>(extranonce2_size * 2), '0');
 
+    const uint64_t rpc_id = submit_id++;
+    pending_submit_ids.push_back(rpc_id);
+
     std::ostringstream ss;
-    ss << "{\"id\":" << (submit_id++) << ",\"method\":\"mining.submit\",\"params\":[\""
+    ss << "{\"id\":" << rpc_id << ",\"method\":\"mining.submit\",\"params\":[\""
        << user << "\",\"" << job.job_id << "\",\"" << extranonce2 << "\",\""
        << std::hex << std::setfill('0') << std::setw(8) << ntime << "\",\""
        << std::setw(16) << nonce << "\"]}\n";

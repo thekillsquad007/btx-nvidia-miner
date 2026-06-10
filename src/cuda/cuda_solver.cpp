@@ -41,21 +41,15 @@ std::vector<CudaSolution> CollectHits(
         if (!found[i]) continue;
         uint256 cpu_d;
         if (!pow::VerifySolution(job, batch_nonces[i], job.time, cpu_d) ||
-            cpu_d != digests[i]) {
+            cpu_d != digests[i] ||
+            !pow::DigestMeetsTarget(cpu_d, job.target)) {
             continue;
         }
-        const uint8_t* dd = reinterpret_cast<const uint8_t*>(&digests[i]);
-        bool below = true;
-        for (size_t k = 0; k < job.target.size() && k < 32; ++k) {
-            if (dd[k] > job.target[k]) { below = false; break; }
-            if (dd[k] < job.target[k]) break;
-        }
-        if (!below) continue;
         CudaSolution sol;
         sol.found = true;
         sol.nonce = batch_nonces[i];
         sol.ntime = job.time;
-        sol.digest = digests[i];
+        sol.digest = cpu_d;
         solutions.push_back(sol);
     }
     return solutions;
@@ -132,22 +126,15 @@ std::vector<CudaSolution> SolveOnCpu(
             for (uint64_t current = thread_start; current < thread_end; ++current) {
                 ++local_tried;
                 uint256 d;
-                if (pow::VerifySolution(job, current, job.time, d)) {
-                    const uint8_t* dd = reinterpret_cast<const uint8_t*>(&d);
-                    bool below = true;
-                    for (size_t k = 0; k < job.target.size() && k < 32; ++k) {
-                        if (dd[k] > job.target[k]) { below = false; break; }
-                        if (dd[k] < job.target[k]) break;
-                    }
-                    if (below) {
-                        CudaSolution sol;
-                        sol.found = true;
-                        sol.nonce = current;
-                        sol.ntime = job.time;
-                        sol.digest = d;
-                        std::lock_guard<std::mutex> lk(shared.mu);
-                        shared.found.push_back(sol);
-                    }
+                if (pow::VerifySolution(job, current, job.time, d) &&
+                    pow::DigestMeetsTarget(d, job.target)) {
+                    CudaSolution sol;
+                    sol.found = true;
+                    sol.nonce = current;
+                    sol.ntime = job.time;
+                    sol.digest = d;
+                    std::lock_guard<std::mutex> lk(shared.mu);
+                    shared.found.push_back(sol);
                 }
             }
             std::lock_guard<std::mutex> lk(shared.mu);

@@ -241,6 +241,37 @@ bool ParseMatmulMeta(const std::string& fragment, StratumJob& job)
 
 } // namespace
 
+bool BlockTargetFromBits(const std::string& bits_hex, std::vector<uint8_t>& out)
+{
+    if (bits_hex.empty()) return false;
+    unsigned int compact = 0;
+    if (std::sscanf(bits_hex.c_str(), "%x", &compact) != 1) return false;
+
+    const int n_size = static_cast<int>(compact >> 24);
+    uint32_t n_word = compact & 0x007fffffU;
+    if (n_word == 0) return false;
+
+    uint8_t raw[32]{};
+    if (n_size <= 3) {
+        n_word >>= 8 * (3 - n_size);
+        raw[0] = static_cast<uint8_t>(n_word & 0xff);
+        raw[1] = static_cast<uint8_t>((n_word >> 8) & 0xff);
+        raw[2] = static_cast<uint8_t>((n_word >> 16) & 0xff);
+    } else if (n_size > 34) {
+        return false;
+    } else {
+        const int shift_bytes = n_size - 3;
+        if (shift_bytes < 0 || shift_bytes > 29) return false;
+        raw[shift_bytes + 0] = static_cast<uint8_t>(n_word & 0xff);
+        raw[shift_bytes + 1] = static_cast<uint8_t>((n_word >> 8) & 0xff);
+        raw[shift_bytes + 2] = static_cast<uint8_t>((n_word >> 16) & 0xff);
+    }
+
+    uint256 target(raw);
+    out.assign(target.data(), target.data() + 32);
+    return true;
+}
+
 bool TargetFromHex(const std::string& hex, std::vector<uint8_t>& out)
 {
     std::string h = hex;
@@ -255,12 +286,9 @@ bool TargetFromHex(const std::string& hex, std::vector<uint8_t>& out)
     if (h.size() < 64) h = std::string(64 - h.size(), '0') + h;
     if (h.size() > 64) h = h.substr(h.size() - 64);
 
-    out.resize(32);
-    for (int i = 0; i < 32; ++i) {
-        unsigned b = 0;
-        if (std::sscanf(h.c_str() + (i * 2), "%2x", &b) != 1) return false;
-        out[static_cast<size_t>(i)] = static_cast<uint8_t>(b);
-    }
+    uint256 target;
+    uint256_from_hex(target, h);
+    out.assign(target.data(), target.data() + 32);
     return true;
 }
 
@@ -330,6 +358,9 @@ bool StratumJobToPowJob(const StratumJob& job, pow::MatMulJob& out)
 {
     if (job.seed_a.empty() || job.seed_b.empty()) return false;
     if (job.target.empty()) return false;
+    if (job.matmul_n < 512 || job.matmul_b == 0 || job.matmul_r == 0) return false;
+    if (job.matmul_n % job.matmul_b != 0) return false;
+    if (job.matmul_r > job.matmul_n) return false;
 
     out.n = job.matmul_n;
     out.b = job.matmul_b;

@@ -40,6 +40,9 @@ struct MatMulSolution {
 // CPU reference implementation. Must match btxchain/btx exactly for the given header fields + seeds + nonce.
 bool VerifySolution(const MatMulJob& job, uint64_t nonce, uint32_t ntime, uint256& out_digest);
 
+// True when digest <= target using the node's UintToArith256 ordering.
+bool DigestMeetsTarget(const uint256& digest, const std::vector<uint8_t>& target);
+
 // Scan up to max_tries nonces starting at job.nonce_start.
 // Returns on first solution that meets the job.target (share or block).
 MatMulSolution SolveCPU(const MatMulJob& job, uint64_t max_tries, uint32_t ntime = 0);

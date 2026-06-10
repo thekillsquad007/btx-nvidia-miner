@@ -12,6 +12,7 @@ namespace stratum {
 
 // Parse a 64-char (or shorter, left-padded) big-endian hex target into 32 bytes.
 bool TargetFromHex(const std::string& hex, std::vector<uint8_t>& out);
+bool BlockTargetFromBits(const std::string& bits_hex, std::vector<uint8_t>& out);
 
 // True only for pool push messages, not subscribe responses that mention "mining.notify".
 bool IsMiningNotifyLine(const std::string& line);

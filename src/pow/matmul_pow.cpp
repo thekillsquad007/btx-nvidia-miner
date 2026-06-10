@@ -42,54 +42,6 @@ static uint256 From32(const uint8_t d[32])
     return uint256(d);
 }
 
-// Replicate the node's ComputeMatMulHeaderHash + DeriveSigma exactly.
-uint256 ComputeMatMulHeaderHashForSigma(int32_t version,
-                                        const uint256& prev,
-                                        const uint256& merkle,
-                                        uint32_t time,
-                                        uint32_t bits,
-                                        uint64_t nonce64,
-                                        uint16_t dim,
-                                        const uint256& seed_a,
-                                        const uint256& seed_b)
-{
-    sha256_state h;
-    sha256_init(&h);
-
-    // LE fields
-    uint8_t ver[4];   ver[0] = version&0xff;   ver[1]=(version>>8)&0xff;   ver[2]=(version>>16)&0xff;   ver[3]=(version>>24)&0xff;
-    uint8_t t[4];     t[0] = time&0xff;        t[1]=(time>>8)&0xff;        t[2]=(time>>16)&0xff;        t[3]=(time>>24)&0xff;
-    uint8_t bi[4];    bi[0] = bits&0xff;       bi[1]=(bits>>8)&0xff;       bi[2]=(bits>>16)&0xff;       bi[3]=(bits>>24)&0xff;
-    uint8_t n64[8];   for (int i=0;i<8;i++) n64[i] = (nonce64 >> (i*8)) & 0xff;
-    uint8_t d16[2];   d16[0] = dim & 0xff;     d16[1] = (dim >> 8) & 0xff;
-
-    sha256_update(&h, ver, 4);
-    auto prev_c = ToCanonical(prev);   sha256_update(&h, prev_c.data(), 32);
-    auto merkle_c = ToCanonical(merkle); sha256_update(&h, merkle_c.data(), 32);
-    sha256_update(&h, t, 4);
-    sha256_update(&h, bi, 4);
-    sha256_update(&h, n64, 8);
-    sha256_update(&h, d16, 2);
-    auto sa = ToCanonical(seed_a); sha256_update(&h, sa.data(), 32);
-    auto sb = ToCanonical(seed_b); sha256_update(&h, sb.data(), 32);
-
-    uint8_t first[32];
-    sha256_final(&h, first);
-
-    sha256_state h2;
-    sha256_init(&h2);
-    sha256_update(&h2, first, 32);
-    uint8_t sigma_bytes[32];
-    sha256_final(&h2, sigma_bytes);
-
-    return FromCanonical({}); // placeholder to satisfy signature; we return proper below
-    // Actually construct:
-    uint256 sigma;
-    std::memcpy(sigma.data(), sigma_bytes, 32); // store in the internal order we chose
-    // The ToCanonical on this sigma later will reverse again to feed the PRFs — this mirrors the node.
-    return sigma;
-}
-
 // Corrected version that returns the 32-byte sigma directly for PRF use.
 static std::array<uint8_t, 32> DeriveSigmaBytes(int32_t version,
                                                 const uint256& prev,
@@ -111,14 +63,15 @@ static std::array<uint8_t, 32> DeriveSigmaBytes(int32_t version,
     uint8_t dm[2];   dm[0]=dim&0xff; dm[1]=(dim>>8)&0xff;
 
     sha256_update(&h, ver, 4);
-    auto pc = ToCanonical(prev);   sha256_update(&h, pc.data(), 32);
-    auto mc = ToCanonical(merkle); sha256_update(&h, mc.data(), 32);
+    // Node hashes header uint256 fields via .data() (internal layout), not ToCanonical.
+    sha256_update(&h, prev.data(), 32);
+    sha256_update(&h, merkle.data(), 32);
     sha256_update(&h, t, 4);
     sha256_update(&h, bi, 4);
     sha256_update(&h, n64, 8);
     sha256_update(&h, dm, 2);
-    auto sa = ToCanonical(seed_a); sha256_update(&h, sa.data(), 32);
-    auto sb = ToCanonical(seed_b); sha256_update(&h, sb.data(), 32);
+    sha256_update(&h, seed_a.data(), 32);
+    sha256_update(&h, seed_b.data(), 32);
 
     uint8_t first[32];
     sha256_final(&h, first);
@@ -139,20 +92,35 @@ static uint256 MakeUint256(const std::array<uint8_t, 32>& b)
     return u;
 }
 
-static bool IsBelowTarget(const uint8_t digest[32], const std::vector<uint8_t>& target_be)
+static uint32_t ReadLE32(const uint8_t* p)
 {
-    if (target_be.size() != 32) return false;
-    // Compare as big-endian 256-bit: first byte that differs decides
-    for (int i = 0; i < 32; ++i) {
-        if (digest[i] < target_be[i]) return true;
-        if (digest[i] > target_be[i]) return false;
+    return static_cast<uint32_t>(p[0]) |
+           (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16) |
+           (static_cast<uint32_t>(p[3]) << 24);
+}
+
+// Match btxchain/btx UintToArith256 comparison (arith_uint256::operator<=).
+static bool IsBelowTarget(const uint8_t digest[32], const std::vector<uint8_t>& target)
+{
+    if (target.size() != 32) return false;
+    for (int i = 7; i >= 0; --i) {
+        const uint32_t d = ReadLE32(digest + i * 4);
+        const uint32_t t = ReadLE32(target.data() + i * 4);
+        if (d < t) return true;
+        if (d > t) return false;
     }
-    return true; // equal is valid
+    return true;
 }
 
 } // namespace
 
 // Public API -----------------------------------------------------------------
+
+bool DigestMeetsTarget(const uint256& digest, const std::vector<uint8_t>& target)
+{
+    return IsBelowTarget(digest.data(), target);
+}
 
 bool VerifySolution(const MatMulJob& job, uint64_t nonce, uint32_t ntime, uint256& out_digest)
 {
