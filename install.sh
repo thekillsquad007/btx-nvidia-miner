@@ -131,6 +131,32 @@ fi
 
 echo "CUDA Toolkit found: $(nvcc --version | tail -1)"
 
+# Check minimum version (we need CUDA 12+ for C++17/CUDA17)
+CUDA_VER=$(nvcc --version | grep -oP 'release \K[0-9]+\.[0-9]+' || echo "0.0")
+if [[ $(echo "$CUDA_VER < 12.0" | bc -l 2>/dev/null || echo 1) -eq 1 ]]; then
+    cat <<'EOM'
+ERROR: Your installed CUDA ($CUDA_VER) is too old.
+
+This miner requires CUDA 12.0 or newer (for modern C++17 / CUDA17 support and good performance).
+
+On Hive OS or Ubuntu, install a recent version using the commands below, then re-run this installer.
+
+Typical for driver 550/580 series (CUDA 12.4 recommended):
+
+  wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+  sudo dpkg -i cuda-keyring_1.1-1_all.deb
+  sudo apt-get update
+  sudo apt-get install -y cuda-compiler-12-4 cuda-cudart-dev-12-4
+
+After install:
+  export PATH=/usr/local/cuda/bin:$PATH
+  nvcc --version   # should show 12.x
+
+Then re-run the full installer command.
+EOM
+    exit 1
+fi
+
 # Clone / update source
 SRC_DIR="${HOME}/btx-nvidia-miner-src"
 if [[ -d "$SRC_DIR/.git" ]]; then
