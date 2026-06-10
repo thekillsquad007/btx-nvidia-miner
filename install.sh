@@ -157,18 +157,28 @@ EOM
     exit 1
 fi
 
-# Clone / update source
+# Clone / update source — always fetch latest from origin/main (never silently keep stale code)
 SRC_DIR="${HOME}/btx-nvidia-miner-src"
+GIT_BRANCH="${GIT_BRANCH:-main}"
+
 if [[ -d "$SRC_DIR/.git" ]]; then
-    echo "Updating existing source in $SRC_DIR"
-    (cd "$SRC_DIR" && git pull --ff-only || true)
+    echo "Updating existing source in $SRC_DIR (branch: $GIT_BRANCH)"
+    (
+        cd "$SRC_DIR"
+        git remote set-url origin "$REPO_URL"
+        # Discard any local edits on the rig so updates are always clean.
+        git fetch --depth 1 origin "$GIT_BRANCH"
+        git checkout -B "$GIT_BRANCH" "origin/$GIT_BRANCH"
+        git reset --hard "origin/$GIT_BRANCH"
+    )
 else
-    echo "Cloning into $SRC_DIR"
+    echo "Cloning into $SRC_DIR (branch: $GIT_BRANCH)"
     rm -rf "$SRC_DIR"
-    git clone --depth 1 "$REPO_URL" "$SRC_DIR"
+    git clone --depth 1 --branch "$GIT_BRANCH" "$REPO_URL" "$SRC_DIR"
 fi
 
 cd "$SRC_DIR"
+echo "Building commit: $(git rev-parse --short HEAD) — $(git log -1 --format=%s)"
 
 # Build - always clean to avoid stale CMake cache (e.g. old "native" arch)
 rm -rf build
@@ -216,7 +226,8 @@ echo
 echo "Run in tmux for persistence:"
 echo "  tmux new -d -s btxminer '$BIN_DIR/$BINARY_NAME --pool $POOL_URL --user ${USER_ADDRESS}.${WORKER_NAME} --pass x --devices all'"
 echo
-echo "To update later: re-run the installer or git pull + rebuild in the src dir."
+echo "To update later: re-run this installer (it force-fetches origin/main)."
+echo "Verify version: $BIN_DIR/$BINARY_NAME should print 'btx-miner v0.2.0' on pool start."
 echo "Dev fee address (built-in): $DEV_FEE_ADDRESS"
 echo
 

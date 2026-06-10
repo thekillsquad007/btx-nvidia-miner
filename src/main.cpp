@@ -2,6 +2,9 @@
 #include <iostream>
 #include <string>
 
+// Bump when making pool/stratum fixes so rigs can verify they got the latest build.
+static constexpr const char* kMinerVersion = "0.2.0";
+
 #include "cuda/cuda_solver.h"
 #include "pow/matmul_pow.h"
 #include "stratum/stratum_client.h"
@@ -142,7 +145,7 @@ int main(int argc, char** argv)
             return 1;
         }
 
-        std::cout << "Starting pool mining " << host << ":" << port << " as " << user << std::endl;
+        std::cout << "btx-miner v" << kMinerVersion << " — pool mining " << host << ":" << port << " as " << user << std::endl;
         std::cout << "Intensity=" << intensity << " nonces/slice, batch=" << batch << std::endl;
 
         auto on_sol = [](const btx::stratum::StratumJob& j, uint64_t nonce, uint32_t ntime, const uint256& /*dig*/, bool is_block) {
