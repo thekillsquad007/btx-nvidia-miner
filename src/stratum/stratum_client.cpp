@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <csignal>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -71,6 +72,7 @@ struct StratumClient::Impl {
 
     std::mutex job_mutex;
     std::mutex send_mutex;
+    std::mutex submit_mutex;
     StratumJob current_job;
     bool has_job = false;
 
@@ -105,7 +107,8 @@ struct StratumClient::Impl {
     bool recv_line_blocking(std::string& line);
     void send_line(const std::string& line);
     void handle_notify(const StratumJob& incoming);
-    void submit_share(const StratumJob& job, uint64_t nonce, uint32_t ntime, const uint256& digest);
+    void submit_share(const StratumJob& job, uint64_t nonce, uint32_t ntime,
+                      const uint256& digest, const std::string& submit_user);
     void log(const std::string& msg) const;
 };
 
@@ -216,6 +219,9 @@ bool StratumClient::Impl::connect_socket()
         throw std::runtime_error("connect failed to " + host);
     }
     freeaddrinfo(res);
+
+    // Broken-pipe sends otherwise SIGKILL the process before send() returns EPIPE.
+    signal(SIGPIPE, SIG_IGN);
     return true;
 }
 
@@ -294,9 +300,27 @@ void StratumClient::Impl::begin_session()
 void StratumClient::Impl::send_line(const std::string& line) {
     if (sock < 0) return;
     std::lock_guard<std::mutex> lk(send_mutex);
-    ssize_t sent = send(sock, line.data(), line.size(), 0);
-    if (sent < 0) {
-        throw std::runtime_error("send failed");
+    size_t off = 0;
+    while (off < line.size()) {
+#ifdef MSG_NOSIGNAL
+        const int flags = MSG_NOSIGNAL;
+#else
+        const int flags = 0;
+#endif
+        const ssize_t sent = send(sock, line.data() + off, line.size() - off, flags);
+        if (sent < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EPIPE) {
+                throw std::runtime_error("send failed: connection closed");
+            }
+            throw std::runtime_error("send failed");
+        }
+        if (sent == 0) {
+            throw std::runtime_error("send failed: zero bytes sent");
+        }
+        off += static_cast<size_t>(sent);
     }
 }
 
@@ -365,22 +389,25 @@ void StratumClient::Impl::dispatch_line(const std::string& line)
         return;
     }
 
-    for (auto it = pending_submit_ids.begin(); it != pending_submit_ids.end(); ++it) {
-        if (!ParseRpcResult(line, *it, ok, err)) {
-            continue;
+    {
+        std::lock_guard<std::mutex> lk(submit_mutex);
+        for (auto it = pending_submit_ids.begin(); it != pending_submit_ids.end(); ++it) {
+            if (!ParseRpcResult(line, *it, ok, err)) {
+                continue;
+            }
+            pending_submit_ids.erase(it);
+            if (ok) {
+                ++shares_accepted;
+                LogLine("[stratum] share ACCEPTED (accepted=" + std::to_string(shares_accepted) +
+                        " rejected=" + std::to_string(shares_rejected) + ")");
+            } else {
+                ++shares_rejected;
+                LogLine("[stratum] share REJECTED: " + err +
+                        " (accepted=" + std::to_string(shares_accepted) +
+                        " rejected=" + std::to_string(shares_rejected) + ")");
+            }
+            break;
         }
-        pending_submit_ids.erase(it);
-        if (ok) {
-            ++shares_accepted;
-            LogLine("[stratum] share ACCEPTED (accepted=" + std::to_string(shares_accepted) +
-                    " rejected=" + std::to_string(shares_rejected) + ")");
-        } else {
-            ++shares_rejected;
-            LogLine("[stratum] share REJECTED: " + err +
-                    " (accepted=" + std::to_string(shares_accepted) +
-                    " rejected=" + std::to_string(shares_rejected) + ")");
-        }
-        break;
     }
 }
 
@@ -616,10 +643,11 @@ void StratumClient::Impl::solver_loop() {
                 const bool is_block = have_block_target &&
                                       pow::DigestMeetsTarget(s.digest, block_target);
                 on_solution(snap, s.nonce, submit_ntime, s.digest, is_block);
-                std::string saved = user;
-                user = submit_user;
-                submit_share(snap, s.nonce, submit_ntime, s.digest);
-                user = saved;
+                try {
+                    submit_share(snap, s.nonce, submit_ntime, s.digest, submit_user);
+                } catch (const std::exception& e) {
+                    LogLine(std::string("[stratum] share submit error: ") + e.what());
+                }
             }
 
             {
@@ -665,25 +693,40 @@ void StratumClient::Impl::solver_loop() {
 }
 
 void StratumClient::Impl::submit_share(
-    const StratumJob& job, uint64_t nonce, uint32_t ntime, const uint256& digest)
+    const StratumJob& job, uint64_t nonce, uint32_t ntime, const uint256& digest,
+    const std::string& submit_user)
 {
     std::string extranonce2(static_cast<size_t>(extranonce2_size * 2), '0');
 
-    const uint64_t rpc_id = submit_id++;
-    pending_submit_ids.push_back(rpc_id);
+    uint64_t rpc_id = 0;
+    {
+        std::lock_guard<std::mutex> lk(submit_mutex);
+        rpc_id = submit_id++;
+        pending_submit_ids.push_back(rpc_id);
+    }
 
     std::ostringstream ss;
     ss << "{\"id\":" << rpc_id << ",\"method\":\"mining.submit\",\"params\":[\""
-       << user << "\",\"" << job.job_id << "\",\"" << extranonce2 << "\",\""
+       << submit_user << "\",\"" << job.job_id << "\",\"" << extranonce2 << "\",\""
        << std::hex << std::setfill('0') << std::setw(8) << ntime << "\",\""
        << std::setw(16) << nonce << "\"]}\n";
     try {
         send_line(ss.str());
     } catch (const std::exception& e) {
+        std::lock_guard<std::mutex> lk(submit_mutex);
+        for (auto it = pending_submit_ids.begin(); it != pending_submit_ids.end(); ++it) {
+            if (*it == rpc_id) {
+                pending_submit_ids.erase(it);
+                break;
+            }
+        }
         LogLine(std::string("[stratum] share submit send failed: ") + e.what());
         return;
     }
-    ++shares_submitted;
+    {
+        std::lock_guard<std::mutex> lk(submit_mutex);
+        ++shares_submitted;
+    }
     std::ostringstream slog;
     slog << "[stratum] submitted share job=" << job.job_id
          << " height=" << std::dec << job.block_height
