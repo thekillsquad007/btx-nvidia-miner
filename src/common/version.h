@@ -3,7 +3,7 @@
 namespace btx {
 namespace common {
 
-inline constexpr const char* kMinerVersion = "0.2.22";
+inline constexpr const char* kMinerVersion = "0.2.23";
 
 } // namespace common
 } // namespace btx

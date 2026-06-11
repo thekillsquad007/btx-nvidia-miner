@@ -94,13 +94,11 @@ __device__ void d_sha256_transform(Sha256State* ctx, const uint8_t block[64])
         0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
     };
 
-    uint32_t m[64];
+    // PR#58 windowed schedule: 16-word sliding window (byte-identical, ~2x faster).
+    uint32_t w[16];
     for (int i = 0; i < 16; ++i) {
-        m[i] = ((uint32_t)block[i * 4] << 24) | ((uint32_t)block[i * 4 + 1] << 16) |
+        w[i] = ((uint32_t)block[i * 4] << 24) | ((uint32_t)block[i * 4 + 1] << 16) |
                ((uint32_t)block[i * 4 + 2] << 8) | (uint32_t)block[i * 4 + 3];
-    }
-    for (int i = 16; i < 64; ++i) {
-        m[i] = d_sig1(m[i - 2]) + m[i - 7] + d_sig0(m[i - 15]) + m[i - 16];
     }
 
     uint32_t a = ctx->state[0];
@@ -112,8 +110,16 @@ __device__ void d_sha256_transform(Sha256State* ctx, const uint8_t block[64])
     uint32_t g = ctx->state[6];
     uint32_t h = ctx->state[7];
 
-    for (int i = 0; i < 64; ++i) {
-        uint32_t t1 = h + d_ep1(e) + d_ch(e, f, g) + K[i] + m[i];
+    #pragma unroll
+    for (int t = 0; t < 64; ++t) {
+        uint32_t wt;
+        if (t < 16) {
+            wt = w[t];
+        } else {
+            wt = d_sig1(w[(t - 2) & 15]) + w[(t - 7) & 15] + d_sig0(w[(t - 15) & 15]) + w[(t - 16) & 15];
+            w[t & 15] = wt;
+        }
+        uint32_t t1 = h + d_ep1(e) + d_ch(e, f, g) + K[t] + wt;
         uint32_t t2 = d_ep0(a) + d_maj(a, b, c);
         h = g;
         g = f;
@@ -205,6 +211,138 @@ __device__ void d_sha256_final(Sha256State* ctx, uint8_t hash[32])
     }
 }
 
+__device__ __forceinline__ void d_set_sha_byte(uint32_t w[16], uint32_t offset, uint32_t byte_val)
+{
+    const uint32_t word_index = offset >> 2U;
+    const uint32_t shift = (3U - (offset & 3U)) * 8U;
+    w[word_index] |= byte_val << shift;
+}
+
+__device__ void d_sha256_compress_words(uint32_t state[8], uint32_t w[16])
+{
+    const uint32_t K[64] = {
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+    };
+
+    uint32_t a = state[0];
+    uint32_t b = state[1];
+    uint32_t c = state[2];
+    uint32_t d = state[3];
+    uint32_t e = state[4];
+    uint32_t f = state[5];
+    uint32_t g = state[6];
+    uint32_t h = state[7];
+
+    #pragma unroll
+    for (uint32_t t = 0; t < 64; ++t) {
+        uint32_t wt;
+        if (t < 16) {
+            wt = w[t];
+        } else {
+            wt = d_sig1(w[(t - 2) & 15U]) + w[(t - 7) & 15U] + d_sig0(w[(t - 15) & 15U]) + w[(t - 16) & 15U];
+            w[t & 15U] = wt;
+        }
+        const uint32_t t1 = h + d_ep1(e) + d_ch(e, f, g) + K[t] + wt;
+        const uint32_t t2 = d_ep0(a) + d_maj(a, b, c);
+        h = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 + t2;
+    }
+
+    state[0] += a;
+    state[1] += b;
+    state[2] += c;
+    state[3] += d;
+    state[4] += e;
+    state[5] += f;
+    state[6] += g;
+    state[7] += h;
+}
+
+__device__ void d_sha256_init_words(uint32_t state[8])
+{
+    state[0] = 0x6a09e667;
+    state[1] = 0xbb67ae85;
+    state[2] = 0x3c6ef372;
+    state[3] = 0xa54ff53a;
+    state[4] = 0x510e527f;
+    state[5] = 0x9b05688c;
+    state[6] = 0x1f83d9ab;
+    state[7] = 0x5be0cd19;
+}
+
+__device__ void d_sha256_block0_midstate(const uint8_t* message, uint32_t state[8])
+{
+    d_sha256_init_words(state);
+    uint32_t w[16];
+    for (uint32_t word = 0; word < 16; ++word) {
+        uint32_t packed = 0;
+        for (uint32_t byte = 0; byte < 4; ++byte) {
+            packed = (packed << 8U) | message[word * 4U + byte];
+        }
+        w[word] = packed;
+    }
+    d_sha256_compress_words(state, w);
+}
+
+__device__ void d_sha256_bytes_from_midstate(
+    const uint32_t midstate[8],
+    const uint8_t* message,
+    uint32_t message_len,
+    uint8_t out[32])
+{
+    uint32_t state[8];
+    for (uint32_t i = 0; i < 8; ++i) {
+        state[i] = midstate[i];
+    }
+
+    const uint32_t total_blocks = (message_len + 9U + 63U) / 64U;
+    const uint64_t bit_len = static_cast<uint64_t>(message_len) * 8U;
+    for (uint32_t block = 1; block < total_blocks; ++block) {
+        uint32_t w[16] = {};
+        for (uint32_t word = 0; word < 16; ++word) {
+            uint32_t packed = 0;
+            for (uint32_t byte = 0; byte < 4; ++byte) {
+                const uint32_t message_index = block * 64U + word * 4U + byte;
+                uint8_t value = 0;
+                if (message_index < message_len) {
+                    value = message[message_index];
+                } else if (message_index == message_len) {
+                    value = 0x80U;
+                } else {
+                    const uint32_t length_start = total_blocks * 64U - 8U;
+                    if (message_index >= length_start) {
+                        const uint32_t shift = (7U - (message_index - length_start)) * 8U;
+                        value = static_cast<uint8_t>((bit_len >> shift) & 0xffU);
+                    }
+                }
+                packed = (packed << 8U) | value;
+            }
+            w[word] = packed;
+        }
+        d_sha256_compress_words(state, w);
+    }
+
+    for (uint32_t i = 0; i < 8; ++i) {
+        out[i * 4U] = static_cast<uint8_t>((state[i] >> 24U) & 0xffU);
+        out[i * 4U + 1U] = static_cast<uint8_t>((state[i] >> 16U) & 0xffU);
+        out[i * 4U + 2U] = static_cast<uint8_t>((state[i] >> 8U) & 0xffU);
+        out[i * 4U + 3U] = static_cast<uint8_t>(state[i] & 0xffU);
+    }
+}
+
 __device__ void d_to_canonical(const uint8_t* internal, uint8_t* canonical)
 {
     for (int i = 0; i < 32; ++i) {
@@ -247,6 +385,131 @@ __device__ __forceinline__ uint32_t d_dot(const uint32_t* a, const uint32_t* b, 
         r -= kFieldModulus;
     }
     return r;
+}
+
+__device__ void d_pack_oracle_midstate(const uint8_t* seed_internal, uint32_t mid[16])
+{
+    uint8_t seed_bytes[32];
+    d_to_canonical(seed_internal, seed_bytes);
+
+    uint32_t w[8] = {};
+    for (uint32_t i = 0; i < 32; ++i) {
+        d_set_sha_byte(w, i, seed_bytes[31U - i]);
+    }
+
+    uint32_t a = 0x6a09e667U;
+    uint32_t b = 0xbb67ae85U;
+    uint32_t c = 0x3c6ef372U;
+    uint32_t d = 0xa54ff53aU;
+    uint32_t e = 0x510e527fU;
+    uint32_t f = 0x9b05688cU;
+    uint32_t g = 0x1f83d9abU;
+    uint32_t h = 0x5be0cd19U;
+
+    const uint32_t K0[8] = {
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+        0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5
+    };
+    #pragma unroll
+    for (uint32_t t = 0; t < 8; ++t) {
+        const uint32_t t1 = h + d_ep1(e) + d_ch(e, f, g) + K0[t] + w[t];
+        const uint32_t t2 = d_ep0(a) + d_maj(a, b, c);
+        h = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 + t2;
+    }
+
+    mid[0] = w[0];
+    mid[1] = w[1];
+    mid[2] = w[2];
+    mid[3] = w[3];
+    mid[4] = w[4];
+    mid[5] = w[5];
+    mid[6] = w[6];
+    mid[7] = w[7];
+    mid[8] = a;
+    mid[9] = b;
+    mid[10] = c;
+    mid[11] = d;
+    mid[12] = e;
+    mid[13] = f;
+    mid[14] = g;
+    mid[15] = h;
+}
+
+__device__ uint32_t d_oracle_from_midstate(const uint32_t mid[16], uint32_t index)
+{
+    uint32_t w[16];
+    w[0] = mid[0];
+    w[1] = mid[1];
+    w[2] = mid[2];
+    w[3] = mid[3];
+    w[4] = mid[4];
+    w[5] = mid[5];
+    w[6] = mid[6];
+    w[7] = mid[7];
+    #pragma unroll
+    for (uint32_t i = 8; i < 16; ++i) {
+        w[i] = 0U;
+    }
+    d_set_sha_byte(w, 32U, index & 0xffU);
+    d_set_sha_byte(w, 33U, (index >> 8U) & 0xffU);
+    d_set_sha_byte(w, 34U, (index >> 16U) & 0xffU);
+    d_set_sha_byte(w, 35U, (index >> 24U) & 0xffU);
+    d_set_sha_byte(w, 36U, 0x80U);
+    w[15] = 36U * 8U;
+
+    uint32_t a = mid[8];
+    uint32_t b = mid[9];
+    uint32_t c = mid[10];
+    uint32_t d = mid[11];
+    uint32_t e = mid[12];
+    uint32_t f = mid[13];
+    uint32_t g = mid[14];
+    uint32_t h = mid[15];
+
+    const uint32_t K[64] = {
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+    };
+
+    #pragma unroll
+    for (uint32_t t = 8; t < 64; ++t) {
+        uint32_t wt;
+        if (t < 16) {
+            wt = w[t];
+        } else {
+            wt = d_sig1(w[(t - 2) & 15U]) + w[(t - 7) & 15U] + d_sig0(w[(t - 15) & 15U]) + w[(t - 16) & 15U];
+            w[t & 15U] = wt;
+        }
+        const uint32_t t1 = h + d_ep1(e) + d_ch(e, f, g) + K[t] + wt;
+        const uint32_t t2 = d_ep0(a) + d_maj(a, b, c);
+        h = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 + t2;
+    }
+
+    const uint32_t sum = 0x6a09e667U + a;
+    const uint32_t candidate =
+        ((sum & 0xffU) << 24) | (((sum >> 8U) & 0xffU) << 16) |
+        (((sum >> 16U) & 0xffU) << 8) | ((sum >> 24U) & 0xffU);
+    return candidate & kFieldModulus;
 }
 
 __device__ uint32_t d_from_oracle(const uint8_t* seed_internal, uint32_t index)
@@ -410,6 +673,122 @@ __device__ void d_matmul_seed_v2(
     d_sha256_final(&hasher, out_internal);
 }
 
+__device__ uint32_t d_build_seed_v2_message(
+    const CudaJobParams& job,
+    uint64_t nonce64,
+    uint8_t which,
+    uint8_t message[110])
+{
+    uint32_t offset = 0;
+    static const char kTag[] = "BTX_MATMUL_SEED_V2";
+    message[offset++] = static_cast<uint8_t>(sizeof(kTag) - 1);
+    for (size_t i = 0; i < sizeof(kTag) - 1; ++i) {
+        message[offset++] = static_cast<uint8_t>(kTag[i]);
+    }
+    for (int i = 0; i < 32; ++i) {
+        message[offset++] = job.prev_hash[i];
+    }
+    message[offset++] = static_cast<uint8_t>(job.block_height & 0xff);
+    message[offset++] = static_cast<uint8_t>((job.block_height >> 8) & 0xff);
+    message[offset++] = static_cast<uint8_t>((job.block_height >> 16) & 0xff);
+    message[offset++] = static_cast<uint8_t>((job.block_height >> 24) & 0xff);
+    message[offset++] = static_cast<uint8_t>(job.version & 0xff);
+    message[offset++] = static_cast<uint8_t>((job.version >> 8) & 0xff);
+    message[offset++] = static_cast<uint8_t>((job.version >> 16) & 0xff);
+    message[offset++] = static_cast<uint8_t>((job.version >> 24) & 0xff);
+    for (int i = 0; i < 32; ++i) {
+        message[offset++] = job.merkle_root[i];
+    }
+    message[offset++] = static_cast<uint8_t>(job.time & 0xff);
+    message[offset++] = static_cast<uint8_t>((job.time >> 8) & 0xff);
+    message[offset++] = static_cast<uint8_t>((job.time >> 16) & 0xff);
+    message[offset++] = static_cast<uint8_t>((job.time >> 24) & 0xff);
+    message[offset++] = static_cast<uint8_t>(job.bits & 0xff);
+    message[offset++] = static_cast<uint8_t>((job.bits >> 8) & 0xff);
+    message[offset++] = static_cast<uint8_t>((job.bits >> 16) & 0xff);
+    message[offset++] = static_cast<uint8_t>((job.bits >> 24) & 0xff);
+    for (int i = 0; i < 8; ++i) {
+        message[offset++] = static_cast<uint8_t>((nonce64 >> (i * 8)) & 0xff);
+    }
+    const uint16_t dim = static_cast<uint16_t>(job.n);
+    message[offset++] = static_cast<uint8_t>(dim & 0xff);
+    message[offset++] = static_cast<uint8_t>((dim >> 8) & 0xff);
+    message[offset++] = which;
+    return offset;
+}
+
+__device__ uint32_t d_build_header_hash_message(
+    const CudaJobParams& job,
+    uint64_t nonce64,
+    const uint8_t* seed_a,
+    const uint8_t* seed_b,
+    uint8_t message[150])
+{
+    uint32_t offset = 0;
+    message[offset++] = static_cast<uint8_t>(job.version & 0xff);
+    message[offset++] = static_cast<uint8_t>((job.version >> 8) & 0xff);
+    message[offset++] = static_cast<uint8_t>((job.version >> 16) & 0xff);
+    message[offset++] = static_cast<uint8_t>((job.version >> 24) & 0xff);
+    for (int i = 0; i < 32; ++i) {
+        message[offset++] = job.prev_hash[i];
+    }
+    for (int i = 0; i < 32; ++i) {
+        message[offset++] = job.merkle_root[i];
+    }
+    message[offset++] = static_cast<uint8_t>(job.time & 0xff);
+    message[offset++] = static_cast<uint8_t>((job.time >> 8) & 0xff);
+    message[offset++] = static_cast<uint8_t>((job.time >> 16) & 0xff);
+    message[offset++] = static_cast<uint8_t>((job.time >> 24) & 0xff);
+    message[offset++] = static_cast<uint8_t>(job.bits & 0xff);
+    message[offset++] = static_cast<uint8_t>((job.bits >> 8) & 0xff);
+    message[offset++] = static_cast<uint8_t>((job.bits >> 16) & 0xff);
+    message[offset++] = static_cast<uint8_t>((job.bits >> 24) & 0xff);
+    for (int i = 0; i < 8; ++i) {
+        message[offset++] = static_cast<uint8_t>((nonce64 >> (i * 8)) & 0xff);
+    }
+    const uint16_t dim = static_cast<uint16_t>(job.n);
+    message[offset++] = static_cast<uint8_t>(dim & 0xff);
+    message[offset++] = static_cast<uint8_t>((dim >> 8) & 0xff);
+    for (int i = 0; i < 32; ++i) {
+        message[offset++] = seed_a[i];
+    }
+    for (int i = 0; i < 32; ++i) {
+        message[offset++] = seed_b[i];
+    }
+    return offset;
+}
+
+__device__ void d_matmul_seed_v2_midstate(
+    const CudaJobParams& job,
+    uint64_t nonce64,
+    uint8_t which,
+    const uint32_t seed_midstate[8],
+    uint8_t out_internal[32])
+{
+    uint8_t message[110];
+    const uint32_t len = d_build_seed_v2_message(job, nonce64, which, message);
+    d_sha256_bytes_from_midstate(seed_midstate, message, len, out_internal);
+}
+
+__device__ void d_derive_sigma_midstate(
+    const CudaJobParams& job,
+    uint64_t nonce64,
+    const uint8_t* seed_a,
+    const uint8_t* seed_b,
+    const uint32_t header_midstate[8],
+    uint8_t* sigma_internal)
+{
+    uint8_t message[150];
+    const uint32_t len = d_build_header_hash_message(job, nonce64, seed_a, seed_b, message);
+    uint8_t first[32];
+    d_sha256_bytes_from_midstate(header_midstate, message, len, first);
+
+    Sha256State h2;
+    d_sha256_init(&h2);
+    d_sha256_update(&h2, first, 32);
+    d_sha256_final(&h2, sigma_internal);
+}
+
 __device__ void d_derive_sigma(
     const CudaJobParams& job,
     uint64_t nonce64,
@@ -477,9 +856,16 @@ __device__ bool d_sigma_below_prehash(const uint8_t sigma[32], const uint8_t tar
 
 __device__ void d_fill_rect(uint32_t* out, uint32_t rows, uint32_t cols, const uint8_t* seed_internal)
 {
+    __shared__ uint32_t s_oracle_mid[16];
+    if (threadIdx.x == 0) {
+        d_pack_oracle_midstate(seed_internal, s_oracle_mid);
+    }
+    __syncthreads();
+
     const uint32_t total = rows * cols;
     for (uint32_t idx = threadIdx.x; idx < total; idx += blockDim.x) {
-        out[idx] = d_from_oracle(seed_internal, idx);
+        const uint32_t fast = d_oracle_from_midstate(s_oracle_mid, idx);
+        out[idx] = fast < kFieldModulus ? fast : d_from_oracle(seed_internal, idx);
     }
 }
 
@@ -634,6 +1020,133 @@ __device__ void d_finalize_product_digest(
     d_sha256_final(&outer2, digest_out);
 }
 
+__device__ __forceinline__ uint32_t d_reduce64(uint64_t acc)
+{
+    uint64_t fold = (acc & kFieldModulus) + (acc >> 31);
+    uint32_t r = static_cast<uint32_t>((fold & kFieldModulus) + (fold >> 31));
+    if (r >= kFieldModulus) {
+        r -= kFieldModulus;
+    }
+    return r;
+}
+
+__device__ void d_add_lowrank_product(
+    uint32_t* M,
+    uint32_t n,
+    uint32_t rank,
+    const uint32_t* L,
+    const uint32_t* R)
+{
+    const uint32_t total = n * n;
+    for (uint32_t idx = threadIdx.x; idx < total; idx += blockDim.x) {
+        const uint32_t i = idx / n;
+        const uint32_t j = idx % n;
+        uint32_t acc = 0;
+        for (uint32_t k = 0; k < rank; ++k) {
+            acc = d_add(acc, d_mul(L[i * rank + k], R[k * n + j]));
+        }
+        M[idx] = d_add(M[idx], acc);
+    }
+}
+
+__device__ void d_build_factored_rhs(
+    const uint32_t* B,
+    const uint32_t* compress_v,
+    uint32_t n,
+    uint32_t bsz,
+    uint32_t N,
+    uint32_t* rhs)
+{
+    const uint32_t rhs_elems = bsz * n * N;
+    for (uint32_t gid = threadIdx.x; gid < rhs_elems; gid += blockDim.x) {
+        const uint32_t m = gid % n;
+        const uint32_t jx = gid / n;
+        const uint32_t x = jx % bsz;
+        const uint32_t j = jx / bsz;
+        const uint32_t* b_row = B + static_cast<size_t>(m) * n + j * bsz;
+        const uint32_t* w_row = compress_v + x * bsz;
+        uint64_t acc = 0;
+        uint32_t pending = 0;
+        for (uint32_t y = 0; y < bsz; ++y) {
+            acc += static_cast<uint64_t>(w_row[y]) * b_row[y];
+            if (++pending == 4) {
+                acc = (acc & kFieldModulus) + (acc >> 31);
+                acc = (acc & kFieldModulus) + (acc >> 31);
+                pending = 0;
+            }
+        }
+        rhs[gid] = d_reduce64(acc);
+    }
+}
+
+__device__ void d_compute_factored_words(
+    const uint32_t* A,
+    const uint32_t* rhs,
+    uint32_t n,
+    uint32_t bsz,
+    uint32_t N,
+    uint32_t* output)
+{
+    const uint32_t tiles_per_axis = N >> 1U;
+    const uint32_t tiles_per_request = tiles_per_axis * tiles_per_axis;
+    const uint32_t num_warps = blockDim.x >> 5U;
+    const uint32_t lane = threadIdx.x & 31U;
+    const uint32_t warp_id = threadIdx.x >> 5U;
+
+    for (uint32_t tile_index = warp_id; tile_index < tiles_per_request; tile_index += num_warps) {
+        const uint32_t j0 = (tile_index % tiles_per_axis) * 2U;
+        const uint32_t i0 = (tile_index / tiles_per_axis) * 2U;
+        uint64_t acc00 = 0;
+        uint64_t acc01 = 0;
+        uint64_t acc10 = 0;
+        uint64_t acc11 = 0;
+        uint32_t pending = 0;
+        for (uint32_t x = 0; x < bsz; ++x) {
+            const uint32_t* a_row0 = A + static_cast<size_t>(i0 * bsz + x) * n;
+            const uint32_t* a_row1 = a_row0 + static_cast<size_t>(bsz) * n;
+            const uint32_t* d_row0 = rhs + static_cast<size_t>(j0 * bsz + x) * n;
+            const uint32_t* d_row1 = d_row0 + static_cast<size_t>(bsz) * n;
+            for (uint32_t m = lane; m < n; m += 32U) {
+                const uint64_t a0 = a_row0[m];
+                const uint64_t a1 = a_row1[m];
+                const uint64_t d0 = d_row0[m];
+                const uint64_t d1 = d_row1[m];
+                acc00 += a0 * d0;
+                acc01 += a0 * d1;
+                acc10 += a1 * d0;
+                acc11 += a1 * d1;
+                if (++pending == 4) {
+                    acc00 = (acc00 & kFieldModulus) + (acc00 >> 31);
+                    acc01 = (acc01 & kFieldModulus) + (acc01 >> 31);
+                    acc10 = (acc10 & kFieldModulus) + (acc10 >> 31);
+                    acc11 = (acc11 & kFieldModulus) + (acc11 >> 31);
+                    acc00 = (acc00 & kFieldModulus) + (acc00 >> 31);
+                    acc01 = (acc01 & kFieldModulus) + (acc01 >> 31);
+                    acc10 = (acc10 & kFieldModulus) + (acc10 >> 31);
+                    acc11 = (acc11 & kFieldModulus) + (acc11 >> 31);
+                    pending = 0;
+                }
+            }
+        }
+        uint32_t value00 = d_reduce64(acc00);
+        uint32_t value01 = d_reduce64(acc01);
+        uint32_t value10 = d_reduce64(acc10);
+        uint32_t value11 = d_reduce64(acc11);
+        for (uint32_t offset = 16U; offset > 0U; offset >>= 1U) {
+            value00 = d_add(value00, __shfl_down_sync(0xffffffffU, value00, offset));
+            value01 = d_add(value01, __shfl_down_sync(0xffffffffU, value01, offset));
+            value10 = d_add(value10, __shfl_down_sync(0xffffffffU, value10, offset));
+            value11 = d_add(value11, __shfl_down_sync(0xffffffffU, value11, offset));
+        }
+        if (lane == 0) {
+            output[i0 * N + j0] = value00;
+            output[i0 * N + j0 + 1U] = value01;
+            output[(i0 + 1U) * N + j0] = value10;
+            output[(i0 + 1U) * N + j0 + 1U] = value11;
+        }
+    }
+}
+
 __device__ void d_build_compress_vec(const uint8_t* sigma_internal, uint32_t bsz, uint32_t* compress_v)
 {
     __shared__ uint8_t s_seed_internal[32];
@@ -664,8 +1177,8 @@ __device__ void d_build_compress_vec(const uint8_t* sigma_internal, uint32_t bsz
 
 __device__ bool d_solve_nonce(
     const CudaJobParams& job,
-    const uint32_t* A,
-    const uint32_t* B,
+    uint32_t* A,
+    uint32_t* B,
     uint64_t nonce64,
     uint32_t* C,
     uint32_t* E_L,
@@ -691,6 +1204,20 @@ __device__ bool d_solve_nonce(
     __shared__ bool s_sigma_pass;
     __shared__ uint8_t s_seed_a[32];
     __shared__ uint8_t s_seed_b[32];
+    __shared__ uint32_t s_seed_midstate[8];
+    __shared__ uint32_t s_header_midstate[8];
+
+    if (threadIdx.x == 0) {
+        if (job.block_height >= btx::pow::kMatMulSeedV2Height) {
+            uint8_t prefix[150];
+            d_build_seed_v2_message(job, 0, 0, prefix);
+            d_sha256_block0_midstate(prefix, s_seed_midstate);
+            d_build_header_hash_message(
+                job, 0, job.prev_hash, job.prev_hash, prefix);
+            d_sha256_block0_midstate(prefix, s_header_midstate);
+        }
+    }
+    __syncthreads();
 
     if (threadIdx.x == 0) {
         if (reuse_seed_a && reuse_seed_b) {
@@ -699,15 +1226,20 @@ __device__ bool d_solve_nonce(
                 s_seed_b[i] = reuse_seed_b[i];
             }
         } else if (job.block_height >= btx::pow::kMatMulSeedV2Height) {
-            d_matmul_seed_v2(job, nonce64, 0, s_seed_a);
-            d_matmul_seed_v2(job, nonce64, 1, s_seed_b);
+            d_matmul_seed_v2_midstate(job, nonce64, 0, s_seed_midstate, s_seed_a);
+            d_matmul_seed_v2_midstate(job, nonce64, 1, s_seed_midstate, s_seed_b);
         } else {
             for (int i = 0; i < 32; ++i) {
                 s_seed_a[i] = job.seed_a[i];
                 s_seed_b[i] = job.seed_b[i];
             }
         }
-        d_derive_sigma(job, nonce64, s_seed_a, s_seed_b, s_sigma);
+        if (job.block_height >= btx::pow::kMatMulSeedV2Height) {
+            d_derive_sigma_midstate(
+                job, nonce64, s_seed_a, s_seed_b, s_header_midstate, s_sigma);
+        } else {
+            d_derive_sigma(job, nonce64, s_seed_a, s_seed_b, s_sigma);
+        }
         s_sigma_pass = job.epsilon_bits == 0 ||
                        d_sigma_below_prehash(s_sigma, job.pre_hash_target);
     }
@@ -737,47 +1269,61 @@ __device__ bool d_solve_nonce(
     const uint32_t N = job.n / bsz;
     const uint32_t word_count = N * N;
 
-    d_zero_u32(C, word_count);
-    __syncthreads();
-
     d_build_compress_vec(s_sigma, job.b, compress_v);
     __syncthreads();
 
-    const uint32_t total_steps = N * N * N;
+    const bool use_factored =
+        job.block_height >= btx::pow::kMatMulSeedV2Height &&
+        (job.n % 32U) == 0U &&
+        (N & 1U) == 0U;
 
-    // Product-committed digest: sum compress(A'[i,ell]*B'[ell,j]) over ell per (i,j).
-    for (uint32_t step = 0; step < total_steps; ++step) {
-        const uint32_t bi = step / (N * N);
-        const uint32_t rem = step % (N * N);
-        const uint32_t bj = rem / N;
-        const uint32_t ell = rem % N;
-        const uint32_t row0 = bi * bsz;
-        const uint32_t col0 = bj * bsz;
-        const uint32_t mid0 = ell * bsz;
-
-        d_mat_get(A, job.n, row0, mid0, ablk, bsz);
+    if (use_factored) {
+        d_add_lowrank_product(A, job.n, job.r, E_L, E_R);
         __syncthreads();
-        d_block_lowrank(noise_blk, E_L, E_R, job.n, job.r, job.n, row0, mid0, bsz);
+        d_add_lowrank_product(B, job.n, job.r, F_L, F_R);
         __syncthreads();
-        d_add_block(ablk, noise_blk, bsz);
+        d_build_factored_rhs(B, compress_v, job.n, bsz, N, C);
         __syncthreads();
-
-        d_mat_get(B, job.n, mid0, col0, bblk, bsz);
+        d_compute_factored_words(A, C, job.n, bsz, N, C);
         __syncthreads();
-        d_block_lowrank(noise_blk, F_L, F_R, job.n, job.r, job.n, mid0, col0, bsz);
-        __syncthreads();
-        d_add_block(bblk, noise_blk, bsz);
+    } else {
+        d_zero_u32(C, word_count);
         __syncthreads();
 
-        d_block_matmul(prod, ablk, bblk, bsz);
-        __syncthreads();
+        const uint32_t total_steps = N * N * N;
+        for (uint32_t step = 0; step < total_steps; ++step) {
+            const uint32_t bi = step / (N * N);
+            const uint32_t rem = step % (N * N);
+            const uint32_t bj = rem / N;
+            const uint32_t ell = rem % N;
+            const uint32_t row0 = bi * bsz;
+            const uint32_t col0 = bj * bsz;
+            const uint32_t mid0 = ell * bsz;
 
-        if (threadIdx.x == 0) {
-            const uint32_t word_idx = bi * N + bj;
-            const uint32_t term = d_dot(prod, compress_v, bsz * bsz);
-            C[word_idx] = d_add(C[word_idx], term);
+            d_mat_get(A, job.n, row0, mid0, ablk, bsz);
+            __syncthreads();
+            d_block_lowrank(noise_blk, E_L, E_R, job.n, job.r, job.n, row0, mid0, bsz);
+            __syncthreads();
+            d_add_block(ablk, noise_blk, bsz);
+            __syncthreads();
+
+            d_mat_get(B, job.n, mid0, col0, bblk, bsz);
+            __syncthreads();
+            d_block_lowrank(noise_blk, F_L, F_R, job.n, job.r, job.n, mid0, col0, bsz);
+            __syncthreads();
+            d_add_block(bblk, noise_blk, bsz);
+            __syncthreads();
+
+            d_block_matmul(prod, ablk, bblk, bsz);
+            __syncthreads();
+
+            if (threadIdx.x == 0) {
+                const uint32_t word_idx = bi * N + bj;
+                const uint32_t term = d_dot(prod, compress_v, bsz * bsz);
+                C[word_idx] = d_add(C[word_idx], term);
+            }
+            __syncthreads();
         }
-        __syncthreads();
     }
 
     if (threadIdx.x == 0) {
@@ -849,10 +1395,15 @@ __global__ void matmul_nonce_kernel(
     __shared__ uint8_t s_v2_seed_a[32];
     __shared__ uint8_t s_v2_seed_b[32];
 
+    __shared__ uint32_t s_v2_seed_midstate[8];
+
     if (use_v2) {
         if (threadIdx.x == 0) {
-            d_matmul_seed_v2(params, nonces[idx], 0, s_v2_seed_a);
-            d_matmul_seed_v2(params, nonces[idx], 1, s_v2_seed_b);
+            uint8_t prefix[110];
+            d_build_seed_v2_message(params, 0, 0, prefix);
+            d_sha256_block0_midstate(prefix, s_v2_seed_midstate);
+            d_matmul_seed_v2_midstate(params, nonces[idx], 0, s_v2_seed_midstate, s_v2_seed_a);
+            d_matmul_seed_v2_midstate(params, nonces[idx], 1, s_v2_seed_midstate, s_v2_seed_b);
         }
         __syncthreads();
         d_fill_rect(A_local, n, n, s_v2_seed_a);
