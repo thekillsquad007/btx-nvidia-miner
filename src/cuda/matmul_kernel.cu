@@ -856,16 +856,9 @@ __device__ bool d_sigma_below_prehash(const uint8_t sigma[32], const uint8_t tar
 
 __device__ void d_fill_rect(uint32_t* out, uint32_t rows, uint32_t cols, const uint8_t* seed_internal)
 {
-    __shared__ uint32_t s_oracle_mid[16];
-    if (threadIdx.x == 0) {
-        d_pack_oracle_midstate(seed_internal, s_oracle_mid);
-    }
-    __syncthreads();
-
     const uint32_t total = rows * cols;
     for (uint32_t idx = threadIdx.x; idx < total; idx += blockDim.x) {
-        const uint32_t fast = d_oracle_from_midstate(s_oracle_mid, idx);
-        out[idx] = fast < kFieldModulus ? fast : d_from_oracle(seed_internal, idx);
+        out[idx] = d_from_oracle(seed_internal, idx);
     }
 }
 
@@ -1204,21 +1197,6 @@ __device__ bool d_solve_nonce(
     __shared__ bool s_sigma_pass;
     __shared__ uint8_t s_seed_a[32];
     __shared__ uint8_t s_seed_b[32];
-    __shared__ uint32_t s_seed_midstate[8];
-    __shared__ uint32_t s_header_midstate[8];
-
-    if (threadIdx.x == 0) {
-        if (job.block_height >= btx::pow::kMatMulSeedV2Height) {
-            uint8_t prefix[150];
-            d_build_seed_v2_message(job, 0, 0, prefix);
-            d_sha256_block0_midstate(prefix, s_seed_midstate);
-            d_build_header_hash_message(
-                job, 0, job.prev_hash, job.prev_hash, prefix);
-            d_sha256_block0_midstate(prefix, s_header_midstate);
-        }
-    }
-    __syncthreads();
-
     if (threadIdx.x == 0) {
         if (reuse_seed_a && reuse_seed_b) {
             for (int i = 0; i < 32; ++i) {
@@ -1226,20 +1204,15 @@ __device__ bool d_solve_nonce(
                 s_seed_b[i] = reuse_seed_b[i];
             }
         } else if (job.block_height >= btx::pow::kMatMulSeedV2Height) {
-            d_matmul_seed_v2_midstate(job, nonce64, 0, s_seed_midstate, s_seed_a);
-            d_matmul_seed_v2_midstate(job, nonce64, 1, s_seed_midstate, s_seed_b);
+            d_matmul_seed_v2(job, nonce64, 0, s_seed_a);
+            d_matmul_seed_v2(job, nonce64, 1, s_seed_b);
         } else {
             for (int i = 0; i < 32; ++i) {
                 s_seed_a[i] = job.seed_a[i];
                 s_seed_b[i] = job.seed_b[i];
             }
         }
-        if (job.block_height >= btx::pow::kMatMulSeedV2Height) {
-            d_derive_sigma_midstate(
-                job, nonce64, s_seed_a, s_seed_b, s_header_midstate, s_sigma);
-        } else {
-            d_derive_sigma(job, nonce64, s_seed_a, s_seed_b, s_sigma);
-        }
+        d_derive_sigma(job, nonce64, s_seed_a, s_seed_b, s_sigma);
         s_sigma_pass = job.epsilon_bits == 0 ||
                        d_sigma_below_prehash(s_sigma, job.pre_hash_target);
     }
@@ -1272,10 +1245,8 @@ __device__ bool d_solve_nonce(
     d_build_compress_vec(s_sigma, job.b, compress_v);
     __syncthreads();
 
-    const bool use_factored =
-        job.block_height >= btx::pow::kMatMulSeedV2Height &&
-        (job.n % 32U) == 0U &&
-        (N & 1U) == 0U;
+    // Factored compression disabled pending byte-identical audit (caused code-23 rejects).
+    const bool use_factored = false;
 
     if (use_factored) {
         d_add_lowrank_product(A, job.n, job.r, E_L, E_R);
@@ -1395,15 +1366,10 @@ __global__ void matmul_nonce_kernel(
     __shared__ uint8_t s_v2_seed_a[32];
     __shared__ uint8_t s_v2_seed_b[32];
 
-    __shared__ uint32_t s_v2_seed_midstate[8];
-
     if (use_v2) {
         if (threadIdx.x == 0) {
-            uint8_t prefix[110];
-            d_build_seed_v2_message(params, 0, 0, prefix);
-            d_sha256_block0_midstate(prefix, s_v2_seed_midstate);
-            d_matmul_seed_v2_midstate(params, nonces[idx], 0, s_v2_seed_midstate, s_v2_seed_a);
-            d_matmul_seed_v2_midstate(params, nonces[idx], 1, s_v2_seed_midstate, s_v2_seed_b);
+            d_matmul_seed_v2(params, nonces[idx], 0, s_v2_seed_a);
+            d_matmul_seed_v2(params, nonces[idx], 1, s_v2_seed_b);
         }
         __syncthreads();
         d_fill_rect(A_local, n, n, s_v2_seed_a);
