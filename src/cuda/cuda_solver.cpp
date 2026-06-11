@@ -28,8 +28,14 @@ size_t WorkspaceBytesPerNonce(const pow::MatMulJob& job)
     const size_t noise_elems = 2 * (static_cast<size_t>(n) * r + static_cast<size_t>(r) * n);
     const size_t scratch = static_cast<size_t>(bsz) * bsz;
     const bool use_v2 = job.block_height >= pow::kMatMulSeedV2Height;
-    const size_t v2_base = use_v2 ? (2 * nn) : 0;
-    const size_t per_nonce_elems = v2_base + nn + noise_elems + scratch + scratch * 5;
+    const bool use_factored = (n % 32U) == 0U && ((n / bsz) % 2U) == 0U;
+    const size_t blocks_per_axis = static_cast<size_t>(n / bsz);
+    const size_t matrix_elems = use_v2 ? (2 * nn) : (use_factored ? (2 * nn) : 0);
+    const size_t factored_rhs_elems =
+        use_factored ? (static_cast<size_t>(bsz) * n * blocks_per_axis) : 0;
+    const size_t legacy_scratch_elems = use_factored ? 0 : (scratch * 5);
+    const size_t per_nonce_elems =
+        matrix_elems + nn + noise_elems + scratch + factored_rhs_elems + legacy_scratch_elems;
     return per_nonce_elems * sizeof(uint32_t);
 }
 
