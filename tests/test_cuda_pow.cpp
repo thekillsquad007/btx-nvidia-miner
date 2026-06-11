@@ -46,11 +46,8 @@ static btx::pow::MatMulJob MakeV2Job()
 
 static void VerifyNonceRange(const btx::pow::MatMulJob& job, uint64_t start, uint64_t count)
 {
-    btx::uint256 cpu_digest;
     for (uint64_t nonce = start; nonce < start + count; ++nonce) {
-        const bool cpu_hit = btx::pow::VerifySolution(job, nonce, job.time, cpu_digest);
         assert(CudaVerifyAgainstCpu(job, nonce, job.target));
-        (void)cpu_hit;
     }
 }
 
@@ -59,7 +56,7 @@ int main()
     VerifyNonceRange(MakeSmallJob(), 0, 8);
 
     auto v2 = MakeV2Job();
-    VerifyNonceRange(v2, 1000000, 16);
+    VerifyNonceRange(v2, 1000000, 64);
 
     std::cout << "CUDA PoW matches CPU reference (legacy + v2 sample nonces)." << std::endl;
     return 0;

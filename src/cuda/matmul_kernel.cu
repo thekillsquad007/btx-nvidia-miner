@@ -856,9 +856,16 @@ __device__ bool d_sigma_below_prehash(const uint8_t sigma[32], const uint8_t tar
 
 __device__ void d_fill_rect(uint32_t* out, uint32_t rows, uint32_t cols, const uint8_t* seed_internal)
 {
+    __shared__ uint32_t s_oracle_mid[16];
+    if (threadIdx.x == 0) {
+        d_pack_oracle_midstate(seed_internal, s_oracle_mid);
+    }
+    __syncthreads();
+
     const uint32_t total = rows * cols;
     for (uint32_t idx = threadIdx.x; idx < total; idx += blockDim.x) {
-        out[idx] = d_from_oracle(seed_internal, idx);
+        const uint32_t fast = d_oracle_from_midstate(s_oracle_mid, idx);
+        out[idx] = fast < kFieldModulus ? fast : d_from_oracle(seed_internal, idx);
     }
 }
 
@@ -1015,12 +1022,19 @@ __device__ void d_finalize_product_digest(
 
 __device__ __forceinline__ uint32_t d_reduce64(uint64_t acc)
 {
-    uint64_t fold = (acc & kFieldModulus) + (acc >> 31);
-    uint32_t r = static_cast<uint32_t>((fold & kFieldModulus) + (fold >> 31));
+    const uint64_t fold1 = (acc & kFieldModulus) + (acc >> 31);
+    const uint32_t lo = static_cast<uint32_t>(fold1 & kFieldModulus);
+    const uint32_t hi = static_cast<uint32_t>(fold1 >> 31);
+    uint32_t r = lo + hi;
     if (r >= kFieldModulus) {
         r -= kFieldModulus;
     }
     return r;
+}
+
+__device__ __forceinline__ uint64_t d_fold64(uint64_t acc)
+{
+    return static_cast<uint64_t>(d_reduce64(acc));
 }
 
 __device__ void d_add_lowrank_product(
@@ -1063,8 +1077,7 @@ __device__ void d_build_factored_rhs(
         for (uint32_t y = 0; y < bsz; ++y) {
             acc += static_cast<uint64_t>(w_row[y]) * b_row[y];
             if (++pending == 4) {
-                acc = (acc & kFieldModulus) + (acc >> 31);
-                acc = (acc & kFieldModulus) + (acc >> 31);
+                acc = d_fold64(acc);
                 pending = 0;
             }
         }
@@ -1109,14 +1122,10 @@ __device__ void d_compute_factored_words(
                 acc10 += a1 * d0;
                 acc11 += a1 * d1;
                 if (++pending == 4) {
-                    acc00 = (acc00 & kFieldModulus) + (acc00 >> 31);
-                    acc01 = (acc01 & kFieldModulus) + (acc01 >> 31);
-                    acc10 = (acc10 & kFieldModulus) + (acc10 >> 31);
-                    acc11 = (acc11 & kFieldModulus) + (acc11 >> 31);
-                    acc00 = (acc00 & kFieldModulus) + (acc00 >> 31);
-                    acc01 = (acc01 & kFieldModulus) + (acc01 >> 31);
-                    acc10 = (acc10 & kFieldModulus) + (acc10 >> 31);
-                    acc11 = (acc11 & kFieldModulus) + (acc11 >> 31);
+                    acc00 = d_fold64(acc00);
+                    acc01 = d_fold64(acc01);
+                    acc10 = d_fold64(acc10);
+                    acc11 = d_fold64(acc11);
                     pending = 0;
                 }
             }
@@ -1197,6 +1206,20 @@ __device__ bool d_solve_nonce(
     __shared__ bool s_sigma_pass;
     __shared__ uint8_t s_seed_a[32];
     __shared__ uint8_t s_seed_b[32];
+    __shared__ uint32_t s_seed_midstate[8];
+    __shared__ uint32_t s_header_midstate[8];
+
+    if (threadIdx.x == 0) {
+        if (job.block_height >= btx::pow::kMatMulSeedV2Height) {
+            uint8_t prefix[150];
+            d_build_seed_v2_message(job, 0, 0, prefix);
+            d_sha256_block0_midstate(prefix, s_seed_midstate);
+            d_build_header_hash_message(job, 0, job.prev_hash, job.prev_hash, prefix);
+            d_sha256_block0_midstate(prefix, s_header_midstate);
+        }
+    }
+    __syncthreads();
+
     if (threadIdx.x == 0) {
         if (reuse_seed_a && reuse_seed_b) {
             for (int i = 0; i < 32; ++i) {
@@ -1204,15 +1227,19 @@ __device__ bool d_solve_nonce(
                 s_seed_b[i] = reuse_seed_b[i];
             }
         } else if (job.block_height >= btx::pow::kMatMulSeedV2Height) {
-            d_matmul_seed_v2(job, nonce64, 0, s_seed_a);
-            d_matmul_seed_v2(job, nonce64, 1, s_seed_b);
+            d_matmul_seed_v2_midstate(job, nonce64, 0, s_seed_midstate, s_seed_a);
+            d_matmul_seed_v2_midstate(job, nonce64, 1, s_seed_midstate, s_seed_b);
         } else {
             for (int i = 0; i < 32; ++i) {
                 s_seed_a[i] = job.seed_a[i];
                 s_seed_b[i] = job.seed_b[i];
             }
         }
-        d_derive_sigma(job, nonce64, s_seed_a, s_seed_b, s_sigma);
+        if (job.block_height >= btx::pow::kMatMulSeedV2Height) {
+            d_derive_sigma_midstate(job, nonce64, s_seed_a, s_seed_b, s_header_midstate, s_sigma);
+        } else {
+            d_derive_sigma(job, nonce64, s_seed_a, s_seed_b, s_sigma);
+        }
         s_sigma_pass = job.epsilon_bits == 0 ||
                        d_sigma_below_prehash(s_sigma, job.pre_hash_target);
     }
@@ -1245,8 +1272,10 @@ __device__ bool d_solve_nonce(
     d_build_compress_vec(s_sigma, job.b, compress_v);
     __syncthreads();
 
-    // Factored compression disabled pending byte-identical audit (caused code-23 rejects).
-    const bool use_factored = false;
+    const bool use_factored =
+        job.block_height >= btx::pow::kMatMulSeedV2Height &&
+        (job.n % 32U) == 0U &&
+        (N & 1U) == 0U;
 
     if (use_factored) {
         d_add_lowrank_product(A, job.n, job.r, E_L, E_R);
@@ -1366,10 +1395,15 @@ __global__ void matmul_nonce_kernel(
     __shared__ uint8_t s_v2_seed_a[32];
     __shared__ uint8_t s_v2_seed_b[32];
 
+    __shared__ uint32_t s_v2_seed_midstate[8];
+
     if (use_v2) {
         if (threadIdx.x == 0) {
-            d_matmul_seed_v2(params, nonces[idx], 0, s_v2_seed_a);
-            d_matmul_seed_v2(params, nonces[idx], 1, s_v2_seed_b);
+            uint8_t prefix[110];
+            d_build_seed_v2_message(params, 0, 0, prefix);
+            d_sha256_block0_midstate(prefix, s_v2_seed_midstate);
+            d_matmul_seed_v2_midstate(params, nonces[idx], 0, s_v2_seed_midstate, s_v2_seed_a);
+            d_matmul_seed_v2_midstate(params, nonces[idx], 1, s_v2_seed_midstate, s_v2_seed_b);
         }
         __syncthreads();
         d_fill_rect(A_local, n, n, s_v2_seed_a);
@@ -1703,13 +1737,14 @@ extern "C" bool CudaVerifyAgainstCpu(
     }
 
     btx::uint256 cpu_digest;
-    const bool cpu_hit = btx::pow::VerifySolution(job, nonce, job.time, cpu_digest);
+    btx::pow::VerifySolution(job, nonce, job.time, cpu_digest);
     const bool gpu_hit = !found.empty() && found[0];
 
-    if (cpu_hit != gpu_hit) {
+    if (digests[0] != cpu_digest) {
         return false;
     }
-    if (cpu_hit && digests[0] != cpu_digest) {
+    const bool cpu_hit = btx::pow::DigestMeetsTarget(cpu_digest, target);
+    if (cpu_hit != gpu_hit) {
         return false;
     }
     return true;

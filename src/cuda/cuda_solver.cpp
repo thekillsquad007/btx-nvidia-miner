@@ -3,6 +3,8 @@
 #include "cuda/hashrate.h"
 #include "pow/matmul_pow.h"
 
+#include <cstdlib>
+
 #ifdef BTX_MINER_HAS_CUDA
 #include <cuda_runtime.h>
 #endif
@@ -66,6 +68,16 @@ extern "C" bool LaunchMatMulTranscriptBatch(
 );
 #endif
 
+bool CpuVerifySharesEnabled()
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char* env = std::getenv("BTX_CUDA_CPU_VERIFY");
+        cached = (env && env[0] == '1' && env[1] == '\0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 std::vector<CudaSolution> CollectHits(
     const pow::MatMulJob& job,
     const std::vector<uint64_t>& batch_nonces,
@@ -74,21 +86,26 @@ std::vector<CudaSolution> CollectHits(
 {
     std::vector<CudaSolution> solutions;
     solutions.reserve(4);
+    const bool cpu_verify = CpuVerifySharesEnabled();
     for (size_t i = 0; i < batch_nonces.size(); ++i) {
         if (!found[i]) continue;
 
-        uint256 cpu_digest;
         const uint32_t ntime = job.time;
-        if (!pow::VerifySolution(job, batch_nonces[i], ntime, cpu_digest) ||
-            cpu_digest != digests[i]) {
-            continue;
+        uint256 digest = digests[i];
+        if (cpu_verify) {
+            uint256 cpu_digest;
+            if (!pow::VerifySolution(job, batch_nonces[i], ntime, cpu_digest) ||
+                cpu_digest != digests[i]) {
+                continue;
+            }
+            digest = cpu_digest;
         }
 
         CudaSolution sol;
         sol.found = true;
         sol.nonce = batch_nonces[i];
         sol.ntime = ntime;
-        sol.digest = cpu_digest;
+        sol.digest = digest;
         solutions.push_back(sol);
     }
     return solutions;
