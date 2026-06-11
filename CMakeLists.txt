@@ -29,6 +29,18 @@ if(BTX_MINER_ENABLE_CUDA)
         if(CUDAToolkit_VERSION VERSION_LESS "12.0")
             message(FATAL_ERROR "CUDA 12.0 or newer is required for this miner (found ${CUDAToolkit_VERSION}). Old versions like 10.1 do not support the required C++17 / CUDA17 language standard.")
         endif()
+
+        # Must be set BEFORE enable_language(CUDA). CMake's nvcc probe fails with
+        # "CUDA_ARCHITECTURES is empty" if this is unset (common on Hive/container rigs).
+        if(NOT CMAKE_CUDA_ARCHITECTURES)
+            if(DEFINED CUDA_ARCHS)
+                set(CMAKE_CUDA_ARCHITECTURES "${CUDA_ARCHS}")
+            else()
+                set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90")
+            endif()
+        endif()
+        message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+
         enable_language(CUDA)
         set(CMAKE_CUDA_STANDARD 17)
         set(CMAKE_CUDA_STANDARD_REQUIRED ON)
@@ -51,19 +63,6 @@ if(OpenSSL_FOUND)
 else()
     message(STATUS "OpenSSL not found - will use bundled SHA256 implementation")
     set(HAVE_OPENSSL 0)
-endif()
-
-if(BTX_MINER_ENABLE_CUDA)
-    # Safe default arches for common NVIDIA cards (Ampere+).
-    # User can override: -DCUDA_ARCHS="86;89;90"
-    # Avoid "native" because it can produce 'compute_native' which old nvcc or certain
-    # build environments (containers, WSL, Hive OS partial installs) do not understand.
-    if(NOT DEFINED CUDA_ARCHS)
-        set(CUDA_ARCHS "75;80;86;89;90")
-    endif()
-    set(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCHS})
-
-    message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 endif()
 
 # Sources

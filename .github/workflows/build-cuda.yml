@@ -24,7 +24,7 @@ jobs:
           cd build
           cmake -DCMAKE_BUILD_TYPE=Release \
                 -DBTX_MINER_ENABLE_CUDA=ON \
-                -DCUDA_ARCHS="75;86;89;90" \
+                -DCMAKE_CUDA_ARCHITECTURES="75;86;89;90" \
                 ..
 
       - name: Build

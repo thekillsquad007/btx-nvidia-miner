@@ -188,7 +188,7 @@ cd build
 echo "Configuring (CUDA enabled)..."
 cmake -DCMAKE_BUILD_TYPE=Release \
       -DBTX_MINER_ENABLE_CUDA=ON \
-      -DCUDA_ARCHS="86;89;90" \
+      -DCMAKE_CUDA_ARCHITECTURES="75;86;89;90" \
       ..
 
 echo "Building (this can take a while on first build)..."
@@ -229,7 +229,7 @@ echo "  tmux new -d -s btxminer '$BIN_DIR/$BINARY_NAME --pool $POOL_URL --user $
 echo
 echo "To update later: re-run this installer (it force-fetches origin/main)."
 echo "Installed version: $("$BIN_DIR/$BINARY_NAME" --version 2>/dev/null || echo unknown)"
-echo "Verify pool start also prints: btx-miner v0.2.17"
+echo "Verify pool start prints a recent version, e.g. btx-miner v0.2.19+"
 echo "Do NOT pass --intensity 256 (that caps slices; use --batch 256 if needed)."
 echo "Built from commit: $BUILD_COMMIT"
 echo "Dev fee address (built-in): $DEV_FEE_ADDRESS"
