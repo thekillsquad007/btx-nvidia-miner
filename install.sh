@@ -129,7 +129,14 @@ EOM
     exit 1
 fi
 
+# Prefer the full toolkit install over distro stub /usr/bin/nvcc (common on Hive rigs).
+if [[ -x /usr/local/cuda/bin/nvcc ]]; then
+    export PATH="/usr/local/cuda/bin:${PATH}"
+    export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+fi
+
 echo "CUDA Toolkit found: $(nvcc --version | tail -1)"
+echo "nvcc path: $(command -v nvcc)"
 
 # Check minimum version (we need CUDA 12+ for C++17/CUDA17)
 CUDA_VER=$(nvcc --version | grep -oP 'release \K[0-9]+\.[0-9]+' || echo "0.0")
@@ -181,6 +188,26 @@ cd "$SRC_DIR"
 BUILD_COMMIT="$(git rev-parse --short HEAD)"
 echo "Building commit: $BUILD_COMMIT — $(git log -1 --format=%s)"
 
+# Pick CUDA arch list from installed GPUs (e.g. 8.6 -> sm_86).
+CUDA_ARCH_LIST=""
+if command -v nvidia-smi >/dev/null 2>&1; then
+    while IFS= read -r _cap; do
+        _cap="${_cap//[[:space:]]/}"
+        [[ -z "$_cap" ]] && continue
+        _sm="${_cap//./}"
+        if [[ -n "$CUDA_ARCH_LIST" ]]; then
+            CUDA_ARCH_LIST="${CUDA_ARCH_LIST};${_sm}"
+        else
+            CUDA_ARCH_LIST="${_sm}"
+        fi
+    done < <(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | sort -u)
+fi
+if [[ -z "$CUDA_ARCH_LIST" ]]; then
+    CUDA_ARCH_LIST="86"
+    echo "WARNING: could not read GPU compute caps; defaulting to sm_86"
+fi
+echo "CUDA arch list (from GPUs): $CUDA_ARCH_LIST"
+
 # Build - always clean to avoid stale CMake cache (e.g. old "native" arch)
 rm -rf build
 mkdir -p build
@@ -188,7 +215,7 @@ cd build
 echo "Configuring (CUDA enabled)..."
 cmake -DCMAKE_BUILD_TYPE=Release \
       -DBTX_MINER_ENABLE_CUDA=ON \
-      -DCMAKE_CUDA_ARCHITECTURES="75;86;89;90" \
+      -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH_LIST}" \
       ..
 
 echo "Building (this can take a while on first build)..."

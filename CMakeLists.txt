@@ -26,8 +26,44 @@ endif()
 if(BTX_MINER_ENABLE_CUDA)
     find_package(CUDAToolkit QUIET)
     if(CUDAToolkit_FOUND)
-        if(CUDAToolkit_VERSION VERSION_LESS "12.0")
-            message(FATAL_ERROR "CUDA 12.0 or newer is required for this miner (found ${CUDAToolkit_VERSION}). Old versions like 10.1 do not support the required C++17 / CUDA17 language standard.")
+        if(NOT CUDAToolkit_NVCC_EXECUTABLE)
+            set(CUDAToolkit_NVCC_EXECUTABLE "${CUDAToolkit_BIN_DIR}/nvcc")
+        endif()
+        if(NOT EXISTS "${CUDAToolkit_NVCC_EXECUTABLE}")
+            set(_btx_nvcc_hint "nvcc")
+        else()
+            set(_btx_nvcc_hint "${CUDAToolkit_NVCC_EXECUTABLE}")
+        endif()
+
+        execute_process(
+            COMMAND ${_btx_nvcc_hint} --version
+            OUTPUT_VARIABLE _btx_nvcc_version_text
+            ERROR_VARIABLE _btx_nvcc_version_text
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        set(_btx_nvcc_version "${CUDAToolkit_VERSION}")
+        if(_btx_nvcc_version_text MATCHES "release ([0-9]+\\.[0-9]+)")
+            set(_btx_nvcc_version "${CMAKE_MATCH_1}")
+        endif()
+
+        if(_btx_nvcc_version VERSION_LESS "12.0")
+            message(FATAL_ERROR
+                "CUDA 12.0+ required (nvcc reports ${_btx_nvcc_version} at ${_btx_nvcc_hint}). "
+                "Mining rigs with RTX 3060/3070 (sm_86) need a recent toolkit — install cuda-compiler-12-4 "
+                "and ensure /usr/local/cuda/bin is before /usr/bin in PATH.")
+        endif()
+
+        # Map nvcc version -> highest SM this compiler can target.
+        if(_btx_nvcc_version VERSION_GREATER_EQUAL "12.0")
+            set(_btx_nvcc_max_sm 90)
+        elseif(_btx_nvcc_version VERSION_GREATER_EQUAL "11.8")
+            set(_btx_nvcc_max_sm 89)
+        elseif(_btx_nvcc_version VERSION_GREATER_EQUAL "11.1")
+            set(_btx_nvcc_max_sm 86)
+        elseif(_btx_nvcc_version VERSION_GREATER_EQUAL "11.0")
+            set(_btx_nvcc_max_sm 80)
+        else()
+            set(_btx_nvcc_max_sm 75)
         endif()
 
         # Must be set BEFORE enable_language(CUDA). CMake's nvcc probe fails with
@@ -39,6 +75,36 @@ if(BTX_MINER_ENABLE_CUDA)
                 set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90")
             endif()
         endif()
+
+        # Filter requested arches to what this nvcc actually supports.
+        string(REPLACE ";" " " _btx_arch_tokens "${CMAKE_CUDA_ARCHITECTURES}")
+        separate_arguments(_btx_arch_list UNIX_COMMAND "${_btx_arch_tokens}")
+        set(_btx_arch_filtered "")
+        set(_btx_arch_dropped "")
+        foreach(_btx_arch IN LISTS _btx_arch_list)
+            if(_btx_arch GREATER _btx_nvcc_max_sm)
+                list(APPEND _btx_arch_dropped "${_btx_arch}")
+            else()
+                list(APPEND _btx_arch_filtered "${_btx_arch}")
+            endif()
+        endforeach()
+        if(_btx_arch_dropped)
+            message(FATAL_ERROR
+                "nvcc ${_btx_nvcc_version} (${_btx_nvcc_hint}) cannot target GPU arch(s): "
+                "${_btx_arch_dropped} (max sm_${_btx_nvcc_max_sm}). "
+                "Install CUDA Toolkit 12.x and put /usr/local/cuda/bin before /usr/bin in PATH.")
+        endif()
+        if(NOT _btx_arch_filtered)
+            message(FATAL_ERROR
+                "No usable CUDA architectures after filtering for nvcc ${_btx_nvcc_version}. "
+                "Pass -DCMAKE_CUDA_ARCHITECTURES=<sm_list> matching your GPU and toolkit.")
+        endif()
+        list(REMOVE_DUPLICATES _btx_arch_filtered)
+        list(JOIN _btx_arch_filtered ";" CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}" CACHE STRING "CUDA SM targets" FORCE)
+
+        set(CMAKE_CUDA_COMPILER "${CUDAToolkit_NVCC_EXECUTABLE}" CACHE FILEPATH "CUDA compiler" FORCE)
+        message(STATUS "CUDA nvcc: ${_btx_nvcc_hint} (${_btx_nvcc_version}, max sm_${_btx_nvcc_max_sm})")
         message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
         enable_language(CUDA)
