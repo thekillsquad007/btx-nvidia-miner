@@ -1097,16 +1097,17 @@ extern "C" bool LaunchMatMulTranscriptBatch(
         return false;
     }
 
+    const bool use_v2 = job.block_height >= btx::pow::kMatMulSeedV2Height;
     uint32_t* d_A = nullptr;
     uint32_t* d_B = nullptr;
-    if (!EnsureMatricesOnDevice(device, job, &d_A, &d_B)) {
+    // Post-v2 work derives A/B per nonce on device; skip host matrix upload.
+    if (!use_v2 && !EnsureMatricesOnDevice(device, job, &d_A, &d_B)) {
         return false;
     }
 
     CudaJobParams h_params = MakeCudaJobParams(job, target);
 
     const size_t batch = nonces.size();
-    const bool use_v2 = job.block_height >= btx::pow::kMatMulSeedV2Height;
     const size_t ws_uint32_per_nonce = WorkspaceUint32Count(job.n, job.r, job.b, use_v2);
     const size_t ws_bytes = batch * ws_uint32_per_nonce * sizeof(uint32_t);
 

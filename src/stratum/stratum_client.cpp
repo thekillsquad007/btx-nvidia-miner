@@ -508,6 +508,7 @@ void StratumClient::Impl::handle_notify(const StratumJob& incoming)
 void StratumClient::Impl::solver_loop() {
     LogLine("[stratum] solver loop ready");
     int job_wait_polls = 0;
+    try {
     while (running) {
         StratumJob job;
         bool waiting_for_job = false;
@@ -656,6 +657,11 @@ void StratumClient::Impl::solver_loop() {
                     " rejected=" + std::to_string(shares_rejected));
         }
     }
+    } catch (const std::exception& e) {
+        std::cerr << "[stratum] solver ended: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "[stratum] solver ended unexpectedly" << std::endl;
+    }
 }
 
 void StratumClient::Impl::submit_share(
@@ -671,7 +677,12 @@ void StratumClient::Impl::submit_share(
        << user << "\",\"" << job.job_id << "\",\"" << extranonce2 << "\",\""
        << std::hex << std::setfill('0') << std::setw(8) << ntime << "\",\""
        << std::setw(16) << nonce << "\"]}\n";
-    send_line(ss.str());
+    try {
+        send_line(ss.str());
+    } catch (const std::exception& e) {
+        LogLine(std::string("[stratum] share submit send failed: ") + e.what());
+        return;
+    }
     ++shares_submitted;
     std::ostringstream slog;
     slog << "[stratum] submitted share job=" << job.job_id
