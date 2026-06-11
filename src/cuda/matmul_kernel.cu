@@ -1412,8 +1412,8 @@ __global__ void matmul_nonce_kernel(
         __syncthreads();
     }
 
-    const uint32_t* use_a = use_v2 ? A_local : A;
-    const uint32_t* use_b = use_v2 ? B_local : B;
+    uint32_t* use_a = use_v2 ? A_local : const_cast<uint32_t*>(A);
+    uint32_t* use_b = use_v2 ? B_local : const_cast<uint32_t*>(B);
 
     uint8_t digest[32];
     const uint8_t* reuse_a = use_v2 ? s_v2_seed_a : nullptr;
