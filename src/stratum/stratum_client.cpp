@@ -609,9 +609,12 @@ void StratumClient::Impl::solver_loop() {
         std::string cached_job_id;
         std::string cached_prev_hash;
         if (!StratumJobToPowJob(snap, pjob)) {
-            std::cerr << "[stratum] incomplete job " << snap.job_id
-                      << " (missing seeds/target/header fields)" << std::endl;
+            if (slices_processed == 0 || slices_processed % 20 == 0) {
+                std::cerr << "[stratum] waiting for complete job " << snap.job_id
+                          << " (missing seeds/target/header fields)" << std::endl;
+            }
             slice_in_progress.store(false);
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
             continue;
         }
         cached_job_id = snap.job_id;
