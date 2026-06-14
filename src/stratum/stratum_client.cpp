@@ -563,10 +563,9 @@ void StratumClient::Impl::solver_loop() {
             slice_start = local_nonce_cursor ? local_nonce_cursor : job.nonce64_start;
         }
 
-        // Outer nonce chunk per SolveBatchCuda call; 0 max_batch_size = auto inside CUDA.
-        const int chunk = config.job_chunk_size > 0
-            ? config.job_chunk_size
-            : (config.max_batch_size > 0 ? config.max_batch_size : 65536);
+        // Outer nonce chunk per SolveBatchCuda call (amdbtx-style 65536 feeding).
+        // Decoupled from --batch so a large launch batch does not shrink outer chunks.
+        const int chunk = config.job_chunk_size > 0 ? config.job_chunk_size : 65536;
         const uint64_t slice_cap = static_cast<uint64_t>(
             std::max(config.nonces_per_slice, chunk));
         const auto slice_deadline = std::chrono::steady_clock::now() +
@@ -584,6 +583,7 @@ void StratumClient::Impl::solver_loop() {
                 : "auto";
             LogLine("[stratum] slice starting job=" + job.job_id +
                     " start=" + std::to_string(slice_start) +
+                    " chunk=" + std::to_string(chunk) +
                     " batch=" + batch_label +
                     " max_sec=" + std::to_string(config.slice_max_seconds));
         }
@@ -594,6 +594,26 @@ void StratumClient::Impl::solver_loop() {
         const uint64_t slice_end = slice_start + slice_cap;
         int found_count = 0;
         uint64_t nonces_tried = 0;
+
+        StratumJob snap;
+        {
+            std::lock_guard<std::mutex> lk(job_mutex);
+            snap = current_job;
+        }
+        pow::MatMulJob pjob;
+        std::vector<uint8_t> block_target;
+        bool have_block_target = false;
+        std::string cached_job_id;
+        std::string cached_prev_hash;
+        if (!StratumJobToPowJob(snap, pjob)) {
+            std::cerr << "[stratum] incomplete job " << snap.job_id
+                      << " (missing seeds/target/header fields)" << std::endl;
+            slice_in_progress.store(false);
+            continue;
+        }
+        cached_job_id = snap.job_id;
+        cached_prev_hash = snap.prev_hash;
+        have_block_target = BlockTargetFromBits(snap.bits, block_target);
 
         while (cursor < slice_end && running) {
             if (std::chrono::steady_clock::now() >= slice_deadline) {
@@ -611,21 +631,25 @@ void StratumClient::Impl::solver_loop() {
             const int this_chunk = static_cast<int>(std::min<uint64_t>(
                 static_cast<uint64_t>(chunk), slice_end - cursor));
 
-            StratumJob snap;
             {
                 std::lock_guard<std::mutex> lk(job_mutex);
-                snap = current_job;
+                if (has_job && current_job.prev_hash != snap.prev_hash) {
+                    break;
+                }
+                if (has_job &&
+                    (current_job.job_id != cached_job_id ||
+                     current_job.prev_hash != cached_prev_hash)) {
+                    snap = current_job;
+                    if (!StratumJobToPowJob(snap, pjob)) {
+                        std::cerr << "[stratum] incomplete job " << snap.job_id
+                                  << " (missing seeds/target/header fields)" << std::endl;
+                        break;
+                    }
+                    cached_job_id = snap.job_id;
+                    cached_prev_hash = snap.prev_hash;
+                    have_block_target = BlockTargetFromBits(snap.bits, block_target);
+                }
             }
-
-            pow::MatMulJob pjob;
-            if (!StratumJobToPowJob(snap, pjob)) {
-                std::cerr << "[stratum] incomplete job " << snap.job_id
-                          << " (missing seeds/target/header fields)" << std::endl;
-                break;
-            }
-
-            std::vector<uint8_t> block_target;
-            const bool have_block_target = BlockTargetFromBits(snap.bits, block_target);
 
             auto sols = btx::cuda::SolveBatchCuda(pjob, cursor, this_chunk, config.max_batch_size);
             cursor += static_cast<uint64_t>(this_chunk);

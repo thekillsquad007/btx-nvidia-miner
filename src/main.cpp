@@ -28,6 +28,7 @@ Common:
   --devices 0,1,2|all       GPUs to use (default: all visible)
   --intensity <n>           Max nonces per slice safety cap (default: 20000000)
   --batch <n>               CUDA nonces per kernel launch (0 = auto from VRAM, default)
+  --job-chunk <n>           Nonces per outer solver call (default: 65536, amdbtx-style)
   --slice-seconds <n>       Time-limit each mining slice in seconds (default: 5)
   --verbose                 Extra stratum debug logging
   --benchmark               Run a short throughput test (CPU ref + CUDA if available)
@@ -99,6 +100,7 @@ int main(int argc, char** argv)
     bool verbose = false;
     int intensity = 20'000'000;
     int batch = 0;
+    int job_chunk = 0;
     double slice_seconds = 5.0;
     float dev_fee_override = -1.0f;
     std::string devices_spec = "all";
@@ -119,6 +121,7 @@ int main(int argc, char** argv)
         if (a == "--pass" && i+1 < argc) pass = argv[++i];
         if (a == "--intensity" && i+1 < argc) intensity = std::atoi(argv[++i]);
         if (a == "--batch" && i+1 < argc) batch = std::atoi(argv[++i]);
+        if (a == "--job-chunk" && i+1 < argc) job_chunk = std::atoi(argv[++i]);
         if (a == "--slice-seconds" && i+1 < argc) slice_seconds = std::atof(argv[++i]);
         if (a == "--devices" && i+1 < argc) devices_spec = argv[++i];
         if (a == "--dev-fee" && i+1 < argc) dev_fee_override = parse_dev_fee(argv[++i]);
@@ -196,7 +199,8 @@ int main(int argc, char** argv)
                       << "use --batch for CUDA launch size." << std::endl;
         }
         std::cout << "Slice=" << slice_seconds << "s cap=" << intensity
-                  << " nonces, batch=" << (batch > 0 ? std::to_string(batch) : "auto");
+                  << " nonces, chunk=" << (job_chunk > 0 ? std::to_string(job_chunk) : "65536")
+                  << ", batch=" << (batch > 0 ? std::to_string(batch) : "auto");
         if (devices_spec != "all") std::cout << ", devices=" << devices_spec;
         std::cout << std::endl;
         print_gpu_inventory();
@@ -234,6 +238,7 @@ int main(int argc, char** argv)
         btx::stratum::StratumConfig cfg;
         cfg.nonces_per_slice = intensity > 0 ? intensity : 20'000'000;
         cfg.max_batch_size = batch;
+        cfg.job_chunk_size = job_chunk;
         cfg.slice_max_seconds = slice_seconds > 0.0 ? slice_seconds : 5.0;
         cfg.verbose = verbose;
 

@@ -1632,7 +1632,7 @@ __global__ void sigma_gate_kernel(
     const uint32_t* __restrict__ seed_midstate,
     const uint32_t* __restrict__ header_midstate,
     uint32_t* __restrict__ out_count,
-    uint64_t* __restrict__ out_nonces,
+    uint32_t* __restrict__ out_indices,
     uint8_t* __restrict__ out_sigma,
     uint8_t* __restrict__ out_seed_a,
     uint8_t* __restrict__ out_seed_b)
@@ -1667,7 +1667,7 @@ __global__ void sigma_gate_kernel(
     }
 
     const uint32_t compact_index = atomicAdd(out_count, 1u);
-    out_nonces[compact_index] = nonce;
+    out_indices[compact_index] = static_cast<uint32_t>(idx);
     for (uint32_t i = 0; i < 32; ++i) {
         out_sigma[compact_index * 32 + i] = sigma[i];
         out_seed_a[compact_index * 32 + i] = seed_a[i];
@@ -1909,7 +1909,7 @@ struct DeviceLaunchPool {
     uint8_t* d_digests = nullptr;
     uint8_t* d_found = nullptr;
     uint32_t* d_gate_count = nullptr;
-    uint64_t* d_passed_nonces = nullptr;
+    uint32_t* d_passed_indices = nullptr;
     uint8_t* d_passed_sigma = nullptr;
     uint8_t* d_passed_seed_a = nullptr;
     uint8_t* d_passed_seed_b = nullptr;
@@ -2035,7 +2035,7 @@ void FreeLaunchPool(DeviceLaunchPool& pool)
     if (pool.d_digests) cudaFree(pool.d_digests);
     if (pool.d_found) cudaFree(pool.d_found);
     if (pool.d_gate_count) cudaFree(pool.d_gate_count);
-    if (pool.d_passed_nonces) cudaFree(pool.d_passed_nonces);
+    if (pool.d_passed_indices) cudaFree(pool.d_passed_indices);
     if (pool.d_passed_sigma) cudaFree(pool.d_passed_sigma);
     if (pool.d_passed_seed_a) cudaFree(pool.d_passed_seed_a);
     if (pool.d_passed_seed_b) cudaFree(pool.d_passed_seed_b);
@@ -2076,7 +2076,7 @@ bool EnsureLaunchPool(int device, size_t batch, size_t ws_bytes)
         if (pool.d_digests) cudaFree(pool.d_digests);
         if (pool.d_found) cudaFree(pool.d_found);
         if (pool.d_gate_count) cudaFree(pool.d_gate_count);
-        if (pool.d_passed_nonces) cudaFree(pool.d_passed_nonces);
+        if (pool.d_passed_indices) cudaFree(pool.d_passed_indices);
         if (pool.d_passed_sigma) cudaFree(pool.d_passed_sigma);
         if (pool.d_passed_seed_a) cudaFree(pool.d_passed_seed_a);
         if (pool.d_passed_seed_b) cudaFree(pool.d_passed_seed_b);
@@ -2085,7 +2085,7 @@ bool EnsureLaunchPool(int device, size_t batch, size_t ws_bytes)
         pool.d_digests = nullptr;
         pool.d_found = nullptr;
         pool.d_gate_count = nullptr;
-        pool.d_passed_nonces = nullptr;
+        pool.d_passed_indices = nullptr;
         pool.d_passed_sigma = nullptr;
         pool.d_passed_seed_a = nullptr;
         pool.d_passed_seed_b = nullptr;
@@ -2094,7 +2094,7 @@ bool EnsureLaunchPool(int device, size_t batch, size_t ws_bytes)
         if (cudaMalloc(&pool.d_digests, digest_bytes) != cudaSuccess ||
             cudaMalloc(&pool.d_found, batch) != cudaSuccess ||
             cudaMalloc(&pool.d_gate_count, sizeof(uint32_t)) != cudaSuccess ||
-            cudaMalloc(&pool.d_passed_nonces, batch * sizeof(uint64_t)) != cudaSuccess ||
+            cudaMalloc(&pool.d_passed_indices, batch * sizeof(uint32_t)) != cudaSuccess ||
             cudaMalloc(&pool.d_passed_sigma, batch * 32) != cudaSuccess ||
             cudaMalloc(&pool.d_passed_seed_a, batch * 32) != cudaSuccess ||
             cudaMalloc(&pool.d_passed_seed_b, batch * 32) != cudaSuccess ||
@@ -2106,7 +2106,7 @@ bool EnsureLaunchPool(int device, size_t batch, size_t ws_bytes)
         pool.digest_cap = batch;
     }
     return pool.d_nonces && pool.d_workspace && pool.d_digests && pool.d_found &&
-           pool.d_gate_count && pool.d_passed_nonces && pool.d_passed_sigma &&
+           pool.d_gate_count && pool.d_passed_indices && pool.d_passed_sigma &&
            pool.d_passed_seed_a && pool.d_passed_seed_b &&
            pool.d_seed_midstate && pool.d_header_midstate;
 }
@@ -2392,12 +2392,13 @@ size_t WorkspaceUint32Count(uint32_t n, uint32_t r, uint32_t bsz, bool use_v2_se
 extern "C" bool LaunchMatMulTranscriptBatch(
     int device,
     const btx::pow::MatMulJob& job,
-    const std::vector<uint64_t>& nonces,
+    uint64_t start_nonce,
+    size_t batch_count,
     const std::vector<uint8_t>& target,
     std::vector<btx::uint256>& out_digests,
     std::vector<bool>& out_found)
 {
-    if (nonces.empty()) {
+    if (batch_count == 0) {
         return false;
     }
     if (job.block_height >= btx::pow::kMatMulSeedV3Height && !job.has_parent_mtp) {
@@ -2418,7 +2419,7 @@ extern "C" bool LaunchMatMulTranscriptBatch(
 
     CudaJobParams h_params = MakeCudaJobParams(job, target);
 
-    const size_t batch = nonces.size();
+    const size_t batch = batch_count;
     const size_t ws_uint32_per_nonce = WorkspaceUint32Count(job.n, job.r, job.b, use_v2);
     const size_t per_nonce_ws_bytes = ws_uint32_per_nonce * sizeof(uint32_t);
     const std::vector<uint8_t>& share_target =
@@ -2434,18 +2435,19 @@ extern "C" bool LaunchMatMulTranscriptBatch(
     }
     DeviceLaunchPool& pool = g_launch_pool[device];
 
-    for (size_t i = 1; i < batch; ++i) {
-        if (nonces[i] != nonces.front() + i) {
-            return false;
-        }
-    }
-
     if (!use_v2) {
         if (cudaMemset(pool.d_found, 0, batch) != cudaSuccess) {
             return false;
         }
-        if (cudaMemcpy(pool.d_nonces, nonces.data(), batch * sizeof(uint64_t), cudaMemcpyHostToDevice) !=
-            cudaSuccess) {
+        if (pool.nonce_cap < batch) {
+            return false;
+        }
+        std::vector<uint64_t> host_nonces(batch);
+        for (size_t i = 0; i < batch; ++i) {
+            host_nonces[i] = start_nonce + i;
+        }
+        if (cudaMemcpy(pool.d_nonces, host_nonces.data(), batch * sizeof(uint64_t),
+                       cudaMemcpyHostToDevice) != cudaSuccess) {
             return false;
         }
         matmul_nonce_kernel<<<static_cast<int>(batch), kBlockThreads>>>(
@@ -2479,9 +2481,9 @@ extern "C" bool LaunchMatMulTranscriptBatch(
     const int gate_blocks =
         static_cast<int>((batch + kGateThreads - 1) / kGateThreads);
     sigma_gate_kernel<<<gate_blocks, kGateThreads>>>(
-        h_params, nonces.front(), batch,
+        h_params, start_nonce, batch,
         pool.d_seed_midstate, pool.d_header_midstate, pool.d_gate_count,
-        pool.d_passed_nonces, pool.d_passed_sigma,
+        pool.d_passed_indices, pool.d_passed_sigma,
         pool.d_passed_seed_a, pool.d_passed_seed_b);
 
     if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
@@ -2497,10 +2499,10 @@ extern "C" bool LaunchMatMulTranscriptBatch(
         return true;
     }
 
-    std::vector<uint64_t> passed_nonces(passed);
+    std::vector<uint32_t> passed_indices(passed);
     if (cudaMemcpy(
-            passed_nonces.data(), pool.d_passed_nonces,
-            passed * sizeof(uint64_t), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            passed_indices.data(), pool.d_passed_indices,
+            passed * sizeof(uint32_t), cudaMemcpyDeviceToHost) != cudaSuccess) {
         return false;
     }
 
@@ -2514,8 +2516,7 @@ extern "C" bool LaunchMatMulTranscriptBatch(
     }
 
     for (size_t i = 0; i < passed; ++i) {
-        const size_t original_index =
-            static_cast<size_t>(passed_nonces[i] - nonces.front());
+        const size_t original_index = passed_indices[i];
         if (original_index >= batch) {
             return false;
         }
@@ -2539,10 +2540,9 @@ extern "C" bool CudaVerifyAgainstCpu(
         return false;
     }
 
-    std::vector<uint64_t> nonces = {nonce};
     std::vector<btx::uint256> digests;
     std::vector<bool> found;
-    if (!LaunchMatMulTranscriptBatch(device, job, nonces, target, digests, found)) {
+    if (!LaunchMatMulTranscriptBatch(device, job, nonce, 1, target, digests, found)) {
         return false;
     }
 

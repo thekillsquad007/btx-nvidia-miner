@@ -42,7 +42,7 @@ using SolutionCallback = std::function<void(const StratumJob& job, uint64_t nonc
 struct StratumConfig {
     int nonces_per_slice = 20'000'000;  // safety cap per slice
     int max_batch_size = 0;             // 0 = auto from VRAM per GPU
-    int job_chunk_size = 0;             // 0 = use max_batch_size between job refreshes
+    int job_chunk_size = 0;             // 0 = 65536 outer chunk (amdbtx-style)
     double slice_max_seconds = 5.0;     // time-limit slices (dexbtx-style)
     bool verbose = false;
 };

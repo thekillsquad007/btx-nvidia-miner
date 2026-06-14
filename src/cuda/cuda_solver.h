@@ -20,7 +20,7 @@ struct CudaSolution {
 size_t WorkspaceBytesPerNonce(const pow::MatMulJob& job);
 
 // Pick a launch batch from free VRAM. Returns at least 64, at most max_cap.
-int AutoBatchSizeForDevice(int device, const pow::MatMulJob& job, int max_cap = 2048);
+int AutoBatchSizeForDevice(int device, const pow::MatMulJob& job, int max_cap = 65536);
 
 // Run a search for solutions on available CUDA devices.
 // max_batch_size <= 0 selects AutoBatchSizeForDevice per GPU.
