@@ -20,7 +20,7 @@ REPO_NAME="btx-nvidia-miner"
 REPO_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}.git"
 BINARY_NAME="btx-miner"
 # Pin to the release that ships prebuilt binaries. Bump when publishing a new release.
-RELEASE_VERSION="${BTX_MINER_VERSION:-0.2.32}"
+RELEASE_VERSION="${BTX_MINER_VERSION:-0.2.33}"
 RELEASE_TAG="v${RELEASE_VERSION}"
 RELEASE_ASSET="btx-miner-linux-x86_64.tar.gz"
 RELEASE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${RELEASE_TAG}/${RELEASE_ASSET}"
@@ -395,13 +395,20 @@ echo "Binary installed to: ${BIN_DIR}/${BINARY_NAME}"
 echo "Version: $("${BIN_DIR}/${BINARY_NAME}" --version 2>/dev/null || echo unknown)"
 echo "State file: ${STATE_DIR}/install.env"
 echo
+if "${BIN_DIR}/${BINARY_NAME}" --print-gpu-batch >/dev/null 2>&1; then
+    echo "Per-GPU launch batches (auto, omit --batch to use these):"
+    "${BIN_DIR}/${BINARY_NAME}" --print-gpu-batch | sed 's/^/  /'
+    echo
+fi
 echo "Quick pool start example (1% dev fee is automatic):"
 echo "  ${BIN_DIR}/${BINARY_NAME} \\"
 echo "    --pool ${POOL_URL} \\"
 echo "    --user ${USER_ADDRESS}.${WORKER_NAME} \\"
 echo "    --pass x \\"
-echo "    --batch 10240 \\"
 echo "    --devices all"
+echo
+echo "Mixed-GPU rigs can pin per card (active GPU order from --print-gpu-batch):"
+echo "  ... --batch 0,262144,65536,65536   # auto on GPU0, larger batch on fast cards"
 echo
 echo "Quick solo start example (requires a running btxd with RPC enabled):"
 echo "  ${BIN_DIR}/${BINARY_NAME} \\"
@@ -412,7 +419,7 @@ echo "    --address ${USER_ADDRESS} \\"
 echo "    --devices all"
 echo
 echo "Run in tmux for persistence:"
-echo "  tmux new -d -s btxminer '${BIN_DIR}/${BINARY_NAME} --pool ${POOL_URL} --user ${USER_ADDRESS}.${WORKER_NAME} --pass x --batch 10240 --devices all'"
+echo "  tmux new -d -s btxminer '${BIN_DIR}/${BINARY_NAME} --pool ${POOL_URL} --user ${USER_ADDRESS}.${WORKER_NAME} --pass x --devices all'"
 echo
 echo "To update: re-run this installer (stops old miner, removes old binary, installs ${RELEASE_TAG})."
 echo "To remove only: curl -fsSL .../install.sh | bash -s -- --uninstall-only"

@@ -24,5 +24,8 @@ bool HasCudaSupport();
 // Free VRAM on device after cudaSetDevice(device).
 size_t GetDeviceFreeMemBytes(int device);
 
+// Total VRAM on device (from device properties).
+size_t GetDeviceTotalMemBytes(int device);
+
 } // namespace cuda
 } // namespace btx

@@ -1,5 +1,6 @@
 #include <cstdlib>
 #include <iostream>
+#include <sstream>
 #include <string>
 
 #include "common/version.h"
@@ -27,7 +28,9 @@ Common:
   --pass <password>         Pool password (default: x)
   --devices 0,1,2|all       GPUs to use (default: all visible)
   --intensity <n>           Max nonces per slice safety cap (default: 20000000)
-  --batch <n>               CUDA nonces per kernel launch (0 = auto from VRAM, default)
+  --batch <n>|i,j,k         CUDA nonces per kernel launch (default: auto per GPU)
+                            Comma list sets per-GPU batch in --devices order; 0 = auto
+  --print-gpu-batch         Print per-GPU launch batch plan and exit
   --job-chunk <n>           Nonces per outer solver call (default: 65536, amdbtx-style)
   --slice-seconds <n>       Time-limit each mining slice in seconds (default: 5)
   --verbose                 Extra stratum debug logging
@@ -89,6 +92,43 @@ static float parse_dev_fee(const char* arg)
     return v;
 }
 
+static btx::cuda::BatchLaunchConfig parse_batch_config(const std::string& spec)
+{
+    btx::cuda::BatchLaunchConfig cfg;
+    if (spec.empty()) {
+        return cfg;
+    }
+    if (spec.find(',') == std::string::npos) {
+        cfg.global_batch = std::atoi(spec.c_str());
+        return cfg;
+    }
+    size_t pos = 0;
+    while (pos < spec.size()) {
+        size_t comma = spec.find(',', pos);
+        std::string part = spec.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        cfg.per_device.push_back(part.empty() ? 0 : std::atoi(part.c_str()));
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    return cfg;
+}
+
+static std::string format_batch_config(const btx::cuda::BatchLaunchConfig& cfg)
+{
+    if (!cfg.per_device.empty()) {
+        std::ostringstream ss;
+        for (size_t i = 0; i < cfg.per_device.size(); ++i) {
+            if (i) ss << ',';
+            ss << cfg.per_device[i];
+        }
+        return ss.str();
+    }
+    if (cfg.global_batch > 0) {
+        return std::to_string(cfg.global_batch);
+    }
+    return "auto";
+}
+
 int main(int argc, char** argv)
 {
     std::string mode;
@@ -98,8 +138,9 @@ int main(int argc, char** argv)
     bool do_bench = false;
     bool force_cpu = false;
     bool verbose = false;
+    bool print_gpu_batch = false;
     int intensity = 20'000'000;
-    int batch = 0;
+    btx::cuda::BatchLaunchConfig batch_config;
     int job_chunk = 0;
     double slice_seconds = 5.0;
     float dev_fee_override = -1.0f;
@@ -120,7 +161,8 @@ int main(int argc, char** argv)
         if ((a == "--user" || a == "--address") && i+1 < argc) user = argv[++i];
         if (a == "--pass" && i+1 < argc) pass = argv[++i];
         if (a == "--intensity" && i+1 < argc) intensity = std::atoi(argv[++i]);
-        if (a == "--batch" && i+1 < argc) batch = std::atoi(argv[++i]);
+        if (a == "--batch" && i+1 < argc) batch_config = parse_batch_config(argv[++i]);
+        if (a == "--print-gpu-batch") print_gpu_batch = true;
         if (a == "--job-chunk" && i+1 < argc) job_chunk = std::atoi(argv[++i]);
         if (a == "--slice-seconds" && i+1 < argc) slice_seconds = std::atof(argv[++i]);
         if (a == "--devices" && i+1 < argc) devices_spec = argv[++i];
@@ -130,6 +172,17 @@ int main(int argc, char** argv)
     btx::cuda::SetForceCpu(force_cpu);
     if (!force_cpu) {
         btx::cuda::SetActiveDevices(parse_devices(devices_spec));
+    }
+
+    if (print_gpu_batch) {
+        btx::pow::MatMulJob sample;
+        sample.n = 512;
+        sample.b = 16;
+        sample.r = 8;
+        sample.block_height = btx::pow::kMatMulSeedV2Height;
+        sample.epsilon_bits = 18;
+        btx::cuda::PrintGpuBatchPlan(batch_config, sample);
+        return 0;
     }
 
     if (dev_fee_override >= 0.0f) {
@@ -200,7 +253,7 @@ int main(int argc, char** argv)
         }
         std::cout << "Slice=" << slice_seconds << "s cap=" << intensity
                   << " nonces, chunk=" << (job_chunk > 0 ? std::to_string(job_chunk) : "65536")
-                  << ", batch=" << (batch > 0 ? std::to_string(batch) : "auto");
+                  << ", batch=" << format_batch_config(batch_config);
         if (devices_spec != "all") std::cout << ", devices=" << devices_spec;
         std::cout << std::endl;
         print_gpu_inventory();
@@ -214,18 +267,13 @@ int main(int argc, char** argv)
             std::cout << std::endl;
             btx::cuda::WarmupDevices(active);
 #ifdef BTX_MINER_HAS_CUDA
-            if (batch <= 0) {
-                btx::pow::MatMulJob sample;
-                sample.n = 512;
-                sample.b = 16;
-                sample.r = 8;
-                sample.block_height = btx::pow::kMatMulSeedV2Height;
-                for (int id : active) {
-                    std::cout << "GPU " << id << " auto batch="
-                              << btx::cuda::AutoBatchSizeForDevice(id, sample)
-                              << " (from free VRAM)" << std::endl;
-                }
-            }
+            btx::pow::MatMulJob sample;
+            sample.n = 512;
+            sample.b = 16;
+            sample.r = 8;
+            sample.block_height = btx::pow::kMatMulSeedV2Height;
+            sample.epsilon_bits = 18;
+            btx::cuda::PrintGpuBatchPlan(batch_config, sample);
 #endif
         }
 
@@ -237,7 +285,7 @@ int main(int argc, char** argv)
 
         btx::stratum::StratumConfig cfg;
         cfg.nonces_per_slice = intensity > 0 ? intensity : 20'000'000;
-        cfg.max_batch_size = batch;
+        cfg.batch_config = batch_config;
         cfg.job_chunk_size = job_chunk;
         cfg.slice_max_seconds = slice_seconds > 0.0 ? slice_seconds : 5.0;
         cfg.verbose = verbose;

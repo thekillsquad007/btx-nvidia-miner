@@ -96,5 +96,15 @@ size_t GetDeviceFreeMemBytes(int device)
 #endif
 }
 
+size_t GetDeviceTotalMemBytes(int device)
+{
+    for (const auto& info : EnumerateDevices()) {
+        if (info.index == device) {
+            return info.total_mem_bytes;
+        }
+    }
+    return 0;
+}
+
 } // namespace cuda
 } // namespace btx

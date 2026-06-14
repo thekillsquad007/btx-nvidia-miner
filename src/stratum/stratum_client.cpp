@@ -578,9 +578,12 @@ void StratumClient::Impl::solver_loop() {
         }
 
         if (config.verbose || slices_processed % 20 == 0) {
-            const std::string batch_label = config.max_batch_size > 0
-                ? std::to_string(config.max_batch_size)
-                : "auto";
+            std::string batch_label = "auto";
+            if (!config.batch_config.per_device.empty()) {
+                batch_label = "per-gpu";
+            } else if (config.batch_config.global_batch > 0) {
+                batch_label = std::to_string(config.batch_config.global_batch);
+            }
             LogLine("[stratum] slice starting job=" + job.job_id +
                     " start=" + std::to_string(slice_start) +
                     " chunk=" + std::to_string(chunk) +
@@ -651,7 +654,7 @@ void StratumClient::Impl::solver_loop() {
                 }
             }
 
-            auto sols = btx::cuda::SolveBatchCuda(pjob, cursor, this_chunk, config.max_batch_size);
+            auto sols = btx::cuda::SolveBatchCuda(pjob, cursor, this_chunk, config.batch_config);
             cursor += static_cast<uint64_t>(this_chunk);
             nonces_tried += static_cast<uint64_t>(this_chunk);
 

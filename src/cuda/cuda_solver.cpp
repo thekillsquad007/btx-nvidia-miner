@@ -4,6 +4,7 @@
 #include "pow/matmul_pow.h"
 
 #include <cstdlib>
+#include <iostream>
 
 #ifdef BTX_MINER_HAS_CUDA
 #include <cuda_runtime.h>
@@ -88,6 +89,24 @@ size_t LaunchBatchBytes(const pow::MatMulJob& job, size_t batch)
 
 } // namespace
 
+int AutoBatchCapForDevice(int device)
+{
+    const size_t total = GetDeviceTotalMemBytes(device);
+    if (total >= 28ULL * 1024 * 1024 * 1024) {
+        return 262144;
+    }
+    if (total >= 20ULL * 1024 * 1024 * 1024) {
+        return 131072;
+    }
+    if (total >= 12ULL * 1024 * 1024 * 1024) {
+        return 65536;
+    }
+    if (total >= 8ULL * 1024 * 1024 * 1024) {
+        return 49152;
+    }
+    return 32768;
+}
+
 int AutoBatchSizeForDevice(int device, const pow::MatMulJob& job, int max_cap)
 {
     const size_t per_launch = LaunchBatchBytes(job, 1);
@@ -101,13 +120,62 @@ int AutoBatchSizeForDevice(int device, const pow::MatMulJob& job, int max_cap)
         return 256;
     }
 
+    const int cap = max_cap > 0 ? max_cap : AutoBatchCapForDevice(device);
     const size_t usable = static_cast<size_t>((free_bytes - kReserveBytes) * 0.85);
     int batch = static_cast<int>(usable / LaunchBatchBytes(job, 1));
     batch = std::max(1024, batch);
-    if (max_cap > 0) {
-        batch = std::min(batch, max_cap);
-    }
+    batch = std::min(batch, cap);
     return batch;
+}
+
+int ResolveLaunchBatch(
+    int device,
+    size_t active_index,
+    const BatchLaunchConfig& config,
+    const pow::MatMulJob& job)
+{
+    int requested = config.global_batch;
+    if (!config.per_device.empty()) {
+        if (active_index < config.per_device.size()) {
+            requested = config.per_device[active_index];
+        } else {
+            requested = 0;
+        }
+    }
+    if (requested <= 0) {
+        return AutoBatchSizeForDevice(device, job);
+    }
+    return requested;
+}
+
+void PrintGpuBatchPlan(const BatchLaunchConfig& config, const pow::MatMulJob& job)
+{
+    const auto active = GetActiveDevices();
+    if (active.empty()) {
+        return;
+    }
+    for (size_t i = 0; i < active.size(); ++i) {
+        const int dev = active[i];
+        const int launch = ResolveLaunchBatch(dev, i, config, job);
+        const auto devices = EnumerateDevices();
+        std::string name = "GPU";
+        for (const auto& info : devices) {
+            if (info.index == dev) {
+                name = info.name;
+                break;
+            }
+        }
+        const bool is_auto =
+            (config.per_device.empty() && config.global_batch <= 0) ||
+            (!config.per_device.empty() && i < config.per_device.size() &&
+             config.per_device[i] <= 0);
+        std::cout << "GPU " << dev << " " << name
+                  << " launch batch=" << launch;
+        if (is_auto) {
+            std::cout << " (auto, cap=" << AutoBatchCapForDevice(dev) << ")";
+        }
+        std::cout << std::endl;
+    }
 }
 
 namespace {
@@ -158,14 +226,13 @@ std::vector<CudaSolution> SolveOnDevice(
     const pow::MatMulJob& job,
     uint64_t start_nonce,
     uint64_t count,
-    int max_batch_size)
+    int launch_batch)
 {
     std::vector<CudaSolution> solutions;
     if (count == 0) return solutions;
-
-    const int launch_batch = max_batch_size > 0
-        ? max_batch_size
-        : AutoBatchSizeForDevice(dev, job);
+    if (launch_batch <= 0) {
+        launch_batch = AutoBatchSizeForDevice(dev, job);
+    }
 
     const auto t0 = std::chrono::steady_clock::now();
     uint64_t current_nonce = start_nonce;
@@ -256,7 +323,7 @@ std::vector<CudaSolution> SolveBatchCuda(
     const pow::MatMulJob& job,
     uint64_t start_nonce,
     uint64_t max_tries,
-    int max_batch_size
+    const BatchLaunchConfig& batch_config
 ) {
     if (max_tries == 0) return {};
     if (job.block_height >= pow::kMatMulSeedV3Height && !job.has_parent_mtp) {
@@ -267,7 +334,8 @@ std::vector<CudaSolution> SolveBatchCuda(
     auto usable = GetActiveDevices();
     if (!usable.empty()) {
         if (usable.size() == 1) {
-            return SolveOnDevice(usable[0], job, start_nonce, max_tries, max_batch_size);
+            const int launch_batch = ResolveLaunchBatch(usable[0], 0, batch_config, job);
+            return SolveOnDevice(usable[0], job, start_nonce, max_tries, launch_batch);
         }
 
         // Multi-GPU: split the nonce range across devices and run in parallel.
@@ -285,8 +353,9 @@ std::vector<CudaSolution> SolveBatchCuda(
             const uint64_t dev_start = start_nonce + static_cast<uint64_t>(i) * per_dev;
             const uint64_t dev_count = std::min(per_dev, start_nonce + max_tries - dev_start);
             if (dev_count == 0) continue;
-            workers.emplace_back([&, i, dev_start, dev_count]() {
-                auto sols = SolveOnDevice(usable[i], job, dev_start, dev_count, max_batch_size);
+            const int launch_batch = ResolveLaunchBatch(usable[i], i, batch_config, job);
+            workers.emplace_back([&, i, dev_start, dev_count, launch_batch]() {
+                auto sols = SolveOnDevice(usable[i], job, dev_start, dev_count, launch_batch);
                 std::lock_guard<std::mutex> lk(merged.mu);
                 merged.solutions.insert(merged.solutions.end(), sols.begin(), sols.end());
             });

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "cuda/cuda_solver.h"
 #include "pow/matmul_pow.h"
 
 #include <atomic>
@@ -41,7 +42,7 @@ using SolutionCallback = std::function<void(const StratumJob& job, uint64_t nonc
 
 struct StratumConfig {
     int nonces_per_slice = 20'000'000;  // safety cap per slice
-    int max_batch_size = 0;             // 0 = auto from VRAM per GPU
+    cuda::BatchLaunchConfig batch_config; // 0 / empty = auto per GPU from VRAM tier
     int job_chunk_size = 0;             // 0 = 65536 outer chunk (amdbtx-style)
     double slice_max_seconds = 5.0;     // time-limit slices (dexbtx-style)
     bool verbose = false;
