@@ -32,7 +32,8 @@ struct StratumJob {
     uint32_t matmul_r = 8;
     int epsilon_bits = 18;
     uint64_t nonce64_start = 0;
-    // received_at etc. can be added if needed
+    int64_t parent_mtp = 0;
+    bool has_parent_mtp = false;
 };
 
 // Callback when a solution is found by the solver for a job.

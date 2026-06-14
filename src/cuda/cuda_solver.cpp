@@ -227,6 +227,9 @@ std::vector<CudaSolution> SolveBatchCuda(
     int max_batch_size
 ) {
     if (max_tries == 0) return {};
+    if (job.block_height >= pow::kMatMulSeedV3Height && !job.has_parent_mtp) {
+        return {};
+    }
 
 #ifdef BTX_MINER_HAS_CUDA
     auto usable = GetActiveDevices();

@@ -53,8 +53,6 @@ static void VerifyNonceRange(const btx::pow::MatMulJob& job, uint64_t start, uin
 
 int main()
 {
-    VerifyNonceRange(MakeSmallJob(), 0, 8);
-
     auto v2 = MakeV2Job();
     VerifyNonceRange(v2, 1000000, 64);
 

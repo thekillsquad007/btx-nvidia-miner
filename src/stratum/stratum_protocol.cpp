@@ -236,6 +236,10 @@ bool ParseMatmulMeta(const std::string& fragment, StratumJob& job)
     if (get_uint("matmul_r", n)) job.matmul_r = static_cast<uint32_t>(n);
     if (get_uint("epsilon_bits", n)) job.epsilon_bits = static_cast<int>(n);
     if (get_uint("nonce64_start", n)) job.nonce64_start = n;
+    if (get_uint("parent_mtp", n)) {
+        job.parent_mtp = static_cast<int64_t>(n);
+        job.has_parent_mtp = true;
+    }
     return true;
 }
 
@@ -370,6 +374,11 @@ bool StratumJobToPowJob(const StratumJob& job, pow::MatMulJob& out)
     out.nonce_start = job.nonce64_start;
     out.block_height = job.block_height;
     out.epsilon_bits = job.epsilon_bits > 0 ? static_cast<uint32_t>(job.epsilon_bits) : 0;
+    out.parent_mtp = job.parent_mtp;
+    out.has_parent_mtp = job.has_parent_mtp;
+    if (out.block_height >= pow::kMatMulSeedV3Height && !out.has_parent_mtp) {
+        return false;
+    }
 
     if (!job.bits.empty()) {
         unsigned int b = 0;

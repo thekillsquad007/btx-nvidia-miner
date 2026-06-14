@@ -90,6 +90,27 @@ static void test_pre_hash_target_shift()
     assert(pre[1] == 0xff);
 }
 
+static void test_matmul_seed_v3()
+{
+    btx::uint256 prev;
+    btx::uint256 merkle;
+    uint256_from_hex(prev,
+        "e41768fe0c8ed2d40b967c981e3af7cddf6fc495f844563836756fa76a0d2ec9");
+    uint256_from_hex(merkle,
+        "fe14530b149adfa21a45f7d2666f3c2dbef7296333398ba208ab77ea6b44a6e2");
+
+    const auto seed_a = btx::pow::DeterministicMatMulSeedV3(
+        prev, 1780000000LL, 130500, 536870912, merkle, 1781098511U, 0x1d14bd00U,
+        42ULL, 512, 0);
+    const auto seed_b = btx::pow::DeterministicMatMulSeedV3(
+        prev, 1780000000LL, 130500, 536870912, merkle, 1781098511U, 0x1d14bd00U,
+        42ULL, 512, 1);
+    assert(seed_a != seed_b);
+    assert(seed_a.GetHex() != btx::pow::DeterministicMatMulSeedV2(
+        prev, 130500, 536870912, merkle, 1781098511U, 0x1d14bd00U, 42ULL, 512, 0)
+        .GetHex());
+}
+
 static void test_matmul_seed_v2()
 {
     btx::stratum::StratumJob job;
@@ -158,6 +179,7 @@ int main()
     test_parse_subscribe();
     test_parse_pool_url();
     test_pre_hash_target_shift();
+    test_matmul_seed_v3();
     test_matmul_seed_v2();
     test_live_job_no_false_positives();
     test_pow_smoke();

@@ -10,6 +10,8 @@ namespace pow {
 
 // Post-fork height: per-nonce seed_a/seed_b via DeterministicMatMulSeedV2.
 constexpr uint32_t kMatMulSeedV2Height = 125000;
+// BTX v0.32.10: parent MTP binds seeds at this height and above.
+constexpr uint32_t kMatMulSeedV3Height = 130500;
 
 // Minimal job description for both solo and stratum.
 struct MatMulJob {
@@ -32,6 +34,8 @@ struct MatMulJob {
     uint64_t nonce_start = 0;    // where to begin scanning in this slice
     uint32_t block_height = 0;
     uint32_t epsilon_bits = 0;   // pre-hash sigma gate: sigma must be <= target << N
+    int64_t parent_mtp = 0;
+    bool has_parent_mtp = false;
 };
 
 // Saturating left-shift of a 32-byte arith_uint256 target (matches btx SaturatingLeftShift256).
@@ -40,6 +44,19 @@ std::vector<uint8_t> PreHashTargetShift(const std::vector<uint8_t>& target, uint
 // BTX v0.32.3 per-nonce seed derivation (height >= kMatMulSeedV2Height).
 uint256 DeterministicMatMulSeedV2(
     const uint256& prev_hash,
+    int32_t height,
+    int32_t version,
+    const uint256& merkle_root,
+    uint32_t time,
+    uint32_t bits,
+    uint64_t nonce64,
+    uint16_t matmul_dim,
+    uint8_t which);
+
+// BTX v0.32.10 per-nonce seed derivation (height >= kMatMulSeedV3Height).
+uint256 DeterministicMatMulSeedV3(
+    const uint256& prev_hash,
+    int64_t parent_mtp,
     int32_t height,
     int32_t version,
     const uint256& merkle_root,

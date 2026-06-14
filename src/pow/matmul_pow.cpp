@@ -409,6 +409,49 @@ uint256 DeterministicMatMulSeedV2(
     return From32(digest);
 }
 
+uint256 DeterministicMatMulSeedV3(
+    const uint256& prev_hash,
+    int64_t parent_mtp,
+    int32_t height,
+    int32_t version,
+    const uint256& merkle_root,
+    uint32_t time,
+    uint32_t bits,
+    uint64_t nonce64,
+    uint16_t matmul_dim,
+    uint8_t which)
+{
+    sha256_state hasher;
+    sha256_init(&hasher);
+
+    static const char kTag[] = "BTX_MATMUL_SEED_V3";
+    WriteCompactSize(hasher, sizeof(kTag) - 1);
+    sha256_update(&hasher, reinterpret_cast<const uint8_t*>(kTag), sizeof(kTag) - 1);
+    sha256_update(&hasher, prev_hash.data(), 32);
+
+    uint8_t le[8];
+    WriteLE64(le, static_cast<uint64_t>(parent_mtp));
+    sha256_update(&hasher, le, 8);
+    WriteLE32(le, static_cast<uint32_t>(height));
+    sha256_update(&hasher, le, 4);
+    WriteLE32(le, static_cast<uint32_t>(version));
+    sha256_update(&hasher, le, 4);
+    sha256_update(&hasher, merkle_root.data(), 32);
+    WriteLE32(le, time);
+    sha256_update(&hasher, le, 4);
+    WriteLE32(le, bits);
+    sha256_update(&hasher, le, 4);
+    WriteLE64(le, nonce64);
+    sha256_update(&hasher, le, 8);
+    WriteLE16(le, matmul_dim);
+    sha256_update(&hasher, le, 2);
+    sha256_update(&hasher, &which, 1);
+
+    uint8_t digest[32];
+    sha256_final(&hasher, digest);
+    return From32(digest);
+}
+
 bool SigmaBelowPreHashTarget(const uint8_t sigma[32], const std::vector<uint8_t>& target_arith)
 {
     if (target_arith.size() != 32) return false;
@@ -438,9 +481,20 @@ bool VerifySolution(const MatMulJob& job, uint64_t nonce, uint32_t ntime, uint25
     const uint16_t dim = static_cast<uint16_t>(job.n);
     const uint32_t use_time = ntime ? ntime : job.time;
 
+    if (job.block_height >= kMatMulSeedV3Height && !job.has_parent_mtp) {
+        return false;
+    }
+
     uint256 seed_a = job.seed_a;
     uint256 seed_b = job.seed_b;
-    if (job.block_height >= kMatMulSeedV2Height) {
+    if (job.block_height >= kMatMulSeedV3Height) {
+        seed_a = DeterministicMatMulSeedV3(
+            job.prev_hash, job.parent_mtp, static_cast<int32_t>(job.block_height),
+            job.version, job.merkle_root, use_time, job.bits, nonce, dim, 0);
+        seed_b = DeterministicMatMulSeedV3(
+            job.prev_hash, job.parent_mtp, static_cast<int32_t>(job.block_height),
+            job.version, job.merkle_root, use_time, job.bits, nonce, dim, 1);
+    } else if (job.block_height >= kMatMulSeedV2Height) {
         seed_a = DeterministicMatMulSeedV2(
             job.prev_hash, static_cast<int32_t>(job.block_height), job.version,
             job.merkle_root, use_time, job.bits, nonce, dim, 0);

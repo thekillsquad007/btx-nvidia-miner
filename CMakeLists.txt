@@ -149,6 +149,7 @@ set(POW_SOURCES
     src/pow/noise.cpp
     src/pow/transcript.cpp
     src/pow/matmul_pow.cpp
+    src/pow/uint256_stub.cpp
     src/pow/sha256_portable.cpp   # fallback when no OpenSSL
 )
 
@@ -165,6 +166,7 @@ set(STRATUM_SOURCES
 set(CUDA_SOURCES
     src/cuda/cuda_device.cpp
     src/cuda/hashrate.cpp
+    src/cuda/gpu_sha256.cu
     src/cuda/matmul_kernel.cu
     src/cuda/cuda_solver.cpp
 )
@@ -201,14 +203,14 @@ endif()
 target_sources(btx-miner PRIVATE src/cuda/cuda_solver.cpp src/cuda/cuda_device.cpp src/cuda/hashrate.cpp)
 
 if(BTX_MINER_ENABLE_CUDA)
-    target_sources(btx-miner PRIVATE src/cuda/matmul_kernel.cu)
+    target_sources(btx-miner PRIVATE src/cuda/gpu_sha256.cu src/cuda/matmul_kernel.cu)
     target_link_libraries(btx-miner PRIVATE CUDA::cudart CUDA::cuda_driver)
     target_compile_definitions(btx-miner PRIVATE BTX_MINER_HAS_CUDA=1)
 
     # CUDA specific flags for performance + debug
     set_target_properties(btx-miner PROPERTIES
-        CUDA_SEPARABLE_COMPILATION ON
-        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+        CUDA_SEPARABLE_COMPILATION OFF
+        CUDA_RESOLVE_DEVICE_SYMBOLS OFF
     )
 
     if(MSVC)
@@ -256,14 +258,15 @@ if(BTX_MINER_BUILD_TESTS)
         add_executable(btx-miner-cuda-test
             tests/test_cuda_pow.cpp
             ${POW_SOURCES}
+            src/cuda/gpu_sha256.cu
             src/cuda/matmul_kernel.cu
         )
         target_include_directories(btx-miner-cuda-test PRIVATE src include)
         target_link_libraries(btx-miner-cuda-test PRIVATE CUDA::cudart Threads::Threads)
         target_compile_definitions(btx-miner-cuda-test PRIVATE BTX_MINER_HAS_CUDA=1)
         set_target_properties(btx-miner-cuda-test PROPERTIES
-            CUDA_SEPARABLE_COMPILATION ON
-            CUDA_RESOLVE_DEVICE_SYMBOLS ON
+            CUDA_SEPARABLE_COMPILATION OFF
+            CUDA_RESOLVE_DEVICE_SYMBOLS OFF
         )
         add_test(NAME cuda_pow_reference COMMAND btx-miner-cuda-test)
     endif()
