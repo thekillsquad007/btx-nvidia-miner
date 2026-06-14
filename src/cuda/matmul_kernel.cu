@@ -2444,6 +2444,32 @@ bool ProcessPassedNoncesBatched(
     return true;
 }
 
+void FillPackedJobKey(
+    const btx::pow::MatMulJob& job,
+    const std::vector<uint8_t>& share_target,
+    PackedJobKey& key)
+{
+    std::memset(&key, 0, sizeof(key));
+    std::memcpy(key.prev_hash, job.prev_hash.data(), 32);
+    std::memcpy(key.merkle_root, job.merkle_root.data(), 32);
+    key.time = job.time;
+    key.bits = job.bits;
+    key.version = job.version;
+    key.block_height = job.block_height;
+    key.epsilon_bits = job.epsilon_bits;
+    const std::vector<uint8_t>& use_target =
+        share_target.size() == 32 ? share_target : job.target;
+    if (use_target.size() == 32) {
+        std::memcpy(key.target, use_target.data(), 32);
+        const std::vector<uint8_t>& prehash_base =
+            job.block_target.size() == 32 ? job.block_target : use_target;
+        const auto pre_hash = btx::pow::PreHashTargetShift(prehash_base, job.epsilon_bits);
+        if (pre_hash.size() == 32) {
+            std::memcpy(key.pre_hash_target, pre_hash.data(), 32);
+        }
+    }
+}
+
 bool LaunchGateForBatch(
     DeviceLaunchPool& pool,
     const CudaJobParams& h_params,
@@ -2526,32 +2552,6 @@ bool CollectScatteredHits(
     }
     (void)passed;
     return true;
-}
-
-void FillPackedJobKey(
-    const btx::pow::MatMulJob& job,
-    const std::vector<uint8_t>& share_target,
-    PackedJobKey& key)
-{
-    std::memset(&key, 0, sizeof(key));
-    std::memcpy(key.prev_hash, job.prev_hash.data(), 32);
-    std::memcpy(key.merkle_root, job.merkle_root.data(), 32);
-    key.time = job.time;
-    key.bits = job.bits;
-    key.version = job.version;
-    key.block_height = job.block_height;
-    key.epsilon_bits = job.epsilon_bits;
-    const std::vector<uint8_t>& use_target =
-        share_target.size() == 32 ? share_target : job.target;
-    if (use_target.size() == 32) {
-        std::memcpy(key.target, use_target.data(), 32);
-        const std::vector<uint8_t>& prehash_base =
-            job.block_target.size() == 32 ? job.block_target : use_target;
-        const auto pre_hash = btx::pow::PreHashTargetShift(prehash_base, job.epsilon_bits);
-        if (pre_hash.size() == 32) {
-            std::memcpy(key.pre_hash_target, pre_hash.data(), 32);
-        }
-    }
 }
 
 CudaJobParams MakeCudaJobParams(const btx::pow::MatMulJob& job, const std::vector<uint8_t>& target)
