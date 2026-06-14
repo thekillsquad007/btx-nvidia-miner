@@ -124,16 +124,6 @@ extern "C" bool LaunchMatMulTranscriptBatch(
 );
 #endif
 
-bool CpuVerifySharesEnabled()
-{
-    static int cached = -1;
-    if (cached < 0) {
-        const char* env = std::getenv("BTX_CUDA_CPU_VERIFY");
-        cached = (env && env[0] == '1' && env[1] == '\0') ? 1 : 0;
-    }
-    return cached != 0;
-}
-
 std::vector<CudaSolution> CollectHits(
     const pow::MatMulJob& job,
     uint64_t start_nonce,
@@ -142,27 +132,21 @@ std::vector<CudaSolution> CollectHits(
 {
     std::vector<CudaSolution> solutions;
     solutions.reserve(4);
-    const bool cpu_verify = CpuVerifySharesEnabled();
     for (size_t i = 0; i < found.size(); ++i) {
         if (!found[i]) continue;
 
         const uint64_t nonce = start_nonce + i;
         const uint32_t ntime = job.time;
-        uint256 digest = digests[i];
-        if (cpu_verify) {
-            uint256 cpu_digest;
-            if (!pow::VerifySolution(job, nonce, ntime, cpu_digest) ||
-                cpu_digest != digests[i]) {
-                continue;
-            }
-            digest = cpu_digest;
+        uint256 cpu_digest;
+        if (!pow::VerifySolution(job, nonce, ntime, cpu_digest)) {
+            continue;
         }
 
         CudaSolution sol;
         sol.found = true;
         sol.nonce = nonce;
         sol.ntime = ntime;
-        sol.digest = digest;
+        sol.digest = cpu_digest;
         solutions.push_back(sol);
     }
     return solutions;

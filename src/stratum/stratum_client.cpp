@@ -659,16 +659,31 @@ void StratumClient::Impl::solver_loop() {
                 if (!s.found) continue;
 
                 const uint32_t submit_ntime = s.ntime ? s.ntime : snap.time;
-                if (!pow::DigestMeetsTarget(s.digest, pjob.target)) {
+
+                {
+                    std::lock_guard<std::mutex> lk(job_mutex);
+                    if (!has_job || current_job.job_id != snap.job_id) {
+                        continue;
+                    }
+                }
+
+                uint256 cpu_digest;
+                if (!pow::VerifySolution(pjob, s.nonce, submit_ntime, cpu_digest)) {
+                    if (config.verbose) {
+                        std::ostringstream fp;
+                        fp << "[stratum] dropped GPU false-positive nonce=0x"
+                           << std::hex << s.nonce;
+                        LogLine(fp.str());
+                    }
                     continue;
                 }
 
                 ++found_count;
                 const bool is_block = have_block_target &&
-                                      pow::DigestMeetsTarget(s.digest, block_target);
-                on_solution(snap, s.nonce, submit_ntime, s.digest, is_block);
+                                      pow::DigestMeetsTarget(cpu_digest, block_target);
+                on_solution(snap, s.nonce, submit_ntime, cpu_digest, is_block);
                 try {
-                    submit_share(snap, s.nonce, submit_ntime, s.digest, submit_user);
+                    submit_share(snap, s.nonce, submit_ntime, cpu_digest, submit_user);
                 } catch (const std::exception& e) {
                     LogLine(std::string("[stratum] share submit error: ") + e.what());
                 }
