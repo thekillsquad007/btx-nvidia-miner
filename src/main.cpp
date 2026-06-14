@@ -3,6 +3,7 @@
 #include <sstream>
 #include <string>
 
+#include "common/updater.h"
 #include "common/version.h"
 #include "cuda/cuda_device.h"
 #include "cuda/cuda_solver.h"
@@ -31,7 +32,10 @@ Common:
   --batch <n>|i,j,k         CUDA nonces per kernel launch (default: auto per GPU)
                             Comma list sets per-GPU batch in --devices order; 0 = auto
   --print-gpu-batch         Print per-GPU launch batch plan and exit
-  --job-chunk <n>           Nonces per outer solver call (default: 65536, amdbtx-style)
+  --job-chunk <n>           Nonces per outer solver call (default: auto from GPU batch)
+  --check-update            Print whether a newer release is available
+  --update                  Download and install latest release, then restart
+  --auto-update             Check for updates on startup (pool mode)
   --slice-seconds <n>       Time-limit each mining slice in seconds (default: 5)
   --verbose                 Extra stratum debug logging
   --benchmark               Run a short throughput test (CPU ref + CUDA if available)
@@ -139,6 +143,9 @@ int main(int argc, char** argv)
     bool force_cpu = false;
     bool verbose = false;
     bool print_gpu_batch = false;
+    bool check_update = false;
+    bool do_update = false;
+    bool auto_update = false;
     int intensity = 20'000'000;
     btx::cuda::BatchLaunchConfig batch_config;
     int job_chunk = 0;
@@ -163,6 +170,9 @@ int main(int argc, char** argv)
         if (a == "--intensity" && i+1 < argc) intensity = std::atoi(argv[++i]);
         if (a == "--batch" && i+1 < argc) batch_config = parse_batch_config(argv[++i]);
         if (a == "--print-gpu-batch") print_gpu_batch = true;
+        if (a == "--check-update") check_update = true;
+        if (a == "--update") do_update = true;
+        if (a == "--auto-update") auto_update = true;
         if (a == "--job-chunk" && i+1 < argc) job_chunk = std::atoi(argv[++i]);
         if (a == "--slice-seconds" && i+1 < argc) slice_seconds = std::atof(argv[++i]);
         if (a == "--devices" && i+1 < argc) devices_spec = argv[++i];
@@ -172,6 +182,43 @@ int main(int argc, char** argv)
     btx::cuda::SetForceCpu(force_cpu);
     if (!force_cpu) {
         btx::cuda::SetActiveDevices(parse_devices(devices_spec));
+    }
+
+    if (check_update || do_update || auto_update) {
+        const auto info = btx::common::CheckForUpdate();
+        if (check_update) {
+            if (info.update_available) {
+                std::cout << "Update available: v" << info.latest_version
+                          << " (running v" << info.current_version << ")" << std::endl;
+                std::cout << "Run: btx-miner --update" << std::endl;
+            } else {
+                std::cout << "Up to date: v" << info.current_version << std::endl;
+            }
+            return 0;
+        }
+        if (info.update_available) {
+            std::cout << "[update] Installing v" << info.latest_version
+                      << " (from v" << info.current_version << ")..." << std::endl;
+            std::string err;
+            if (!btx::common::InstallUpdate(info, err)) {
+                std::cerr << "[update] failed: " << err << std::endl;
+                return do_update ? 1 : 0;
+            }
+            std::cout << "[update] Installed v" << info.latest_version << ", restarting..." << std::endl;
+            std::vector<std::string> relaunch;
+            const std::string exe = btx::common::GetExecutablePath();
+            relaunch.push_back(exe.empty() ? argv[0] : exe);
+            for (int i = 1; i < argc; ++i) {
+                const std::string arg = argv[i];
+                if (arg == "--update") continue;
+                if (arg == "--auto-update") continue;
+                relaunch.push_back(arg);
+            }
+            btx::common::ReexecCurrentProcess(relaunch);
+        } else if (do_update) {
+            std::cout << "Already on latest: v" << info.current_version << std::endl;
+            return 0;
+        }
     }
 
     if (print_gpu_batch) {
@@ -251,8 +298,19 @@ int main(int argc, char** argv)
                       << (intensity * 4 / 1000) << "k/s overhead). Omit --intensity for 5s slices; "
                       << "use --batch for CUDA launch size." << std::endl;
         }
+        btx::pow::MatMulJob sample;
+        sample.n = 512;
+        sample.b = 16;
+        sample.r = 8;
+        sample.block_height = btx::pow::kMatMulSeedV2Height;
+        sample.epsilon_bits = 18;
+        const int resolved_job_chunk = job_chunk > 0
+            ? job_chunk
+            : btx::cuda::RecommendJobChunkSize(batch_config, sample);
+
         std::cout << "Slice=" << slice_seconds << "s cap=" << intensity
-                  << " nonces, chunk=" << (job_chunk > 0 ? std::to_string(job_chunk) : "65536")
+                  << " nonces, chunk=" << resolved_job_chunk
+                  << (job_chunk > 0 ? "" : " (auto)")
                   << ", batch=" << format_batch_config(batch_config);
         if (devices_spec != "all") std::cout << ", devices=" << devices_spec;
         std::cout << std::endl;
@@ -267,12 +325,6 @@ int main(int argc, char** argv)
             std::cout << std::endl;
             btx::cuda::WarmupDevices(active);
 #ifdef BTX_MINER_HAS_CUDA
-            btx::pow::MatMulJob sample;
-            sample.n = 512;
-            sample.b = 16;
-            sample.r = 8;
-            sample.block_height = btx::pow::kMatMulSeedV2Height;
-            sample.epsilon_bits = 18;
             btx::cuda::PrintGpuBatchPlan(batch_config, sample);
 #endif
         }
@@ -286,7 +338,7 @@ int main(int argc, char** argv)
         btx::stratum::StratumConfig cfg;
         cfg.nonces_per_slice = intensity > 0 ? intensity : 20'000'000;
         cfg.batch_config = batch_config;
-        cfg.job_chunk_size = job_chunk;
+        cfg.job_chunk_size = resolved_job_chunk;
         cfg.slice_max_seconds = slice_seconds > 0.0 ? slice_seconds : 5.0;
         cfg.verbose = verbose;
 

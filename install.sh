@@ -20,7 +20,7 @@ REPO_NAME="btx-nvidia-miner"
 REPO_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}.git"
 BINARY_NAME="btx-miner"
 # Pin to the release that ships prebuilt binaries. Bump when publishing a new release.
-RELEASE_VERSION="${BTX_MINER_VERSION:-0.2.34}"
+RELEASE_VERSION="${BTX_MINER_VERSION:-0.2.35}"
 RELEASE_TAG="v${RELEASE_VERSION}"
 RELEASE_ASSET="btx-miner-linux-x86_64.tar.gz"
 RELEASE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${RELEASE_TAG}/${RELEASE_ASSET}"
@@ -420,7 +420,10 @@ echo "    --address ${USER_ADDRESS} \\"
 echo "    --devices all"
 echo
 echo "Run in tmux for persistence:"
-echo "  tmux new -d -s btxminer '${BIN_DIR}/${BINARY_NAME} --pool ${POOL_URL} --user ${USER_ADDRESS}.${WORKER_NAME} --pass x --devices all'"
+echo "  tmux new -d -s btxminer '${BIN_DIR}/${BINARY_NAME} --pool ${POOL_URL} --user ${USER_ADDRESS}.${WORKER_NAME} --pass x --devices all --auto-update'"
+echo
+echo "Manual update check: ${BIN_DIR}/${BINARY_NAME} --check-update"
+echo "Force update:        ${BIN_DIR}/${BINARY_NAME} --update"
 echo
 echo "To update: re-run this installer (stops old miner, removes old binary, installs ${RELEASE_TAG})."
 echo "To remove only: curl -fsSL .../install.sh | bash -s -- --uninstall-only"

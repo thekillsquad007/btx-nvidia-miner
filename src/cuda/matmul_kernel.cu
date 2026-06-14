@@ -1902,6 +1902,18 @@ struct DeviceMatrixCache {
 
 DeviceMatrixCache g_matrix_cache[16];
 
+struct PackedJobKey {
+    uint8_t prev_hash[32];
+    uint8_t merkle_root[32];
+    uint32_t time = 0;
+    uint32_t bits = 0;
+    int32_t version = 0;
+    uint32_t block_height = 0;
+    uint32_t epsilon_bits = 0;
+    uint8_t target[32];
+    uint8_t pre_hash_target[32];
+};
+
 struct DeviceLaunchPool {
     int device = -1;
     uint64_t* d_nonces = nullptr;
@@ -1918,6 +1930,8 @@ struct DeviceLaunchPool {
     size_t nonce_cap = 0;
     size_t ws_bytes = 0;
     size_t digest_cap = 0;
+    PackedJobKey job_key{};
+    bool job_midstate_ready = false;
 };
 
 DeviceLaunchPool g_launch_pool[16];
@@ -1944,6 +1958,9 @@ struct BatchedMatMulPool {
     uint8_t* d_block_target = nullptr;
     uint8_t* d_share_target = nullptr;
     size_t capacity = 0;
+    uint8_t cached_block_target[32]{};
+    uint8_t cached_share_target[32]{};
+    bool targets_ready = false;
 };
 
 BatchedMatMulPool g_batched_pool[16];
@@ -2220,6 +2237,24 @@ bool ProcessPassedNoncesBatched(
         return false;
     }
 
+    const bool targets_changed =
+        !pool.targets_ready ||
+        std::memcmp(pool.cached_block_target, block_target.data(), 32) != 0 ||
+        std::memcmp(pool.cached_share_target, share_target.data(), 32) != 0;
+    if (targets_changed) {
+        if (cudaMemcpy(
+                pool.d_block_target, block_target.data(), 32,
+                cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(
+                pool.d_share_target, share_target.data(), 32,
+                cudaMemcpyHostToDevice) != cudaSuccess) {
+            return false;
+        }
+        std::memcpy(pool.cached_block_target, block_target.data(), 32);
+        std::memcpy(pool.cached_share_target, share_target.data(), 32);
+        pool.targets_ready = true;
+    }
+
     if (cudaMemcpy(
             pool.d_seed_a, d_seed_a, batch * 32,
             cudaMemcpyDeviceToDevice) != cudaSuccess ||
@@ -2228,13 +2263,7 @@ bool ProcessPassedNoncesBatched(
             cudaMemcpyDeviceToDevice) != cudaSuccess ||
         cudaMemcpy(
             pool.d_sigma, d_sigma, batch * 32,
-            cudaMemcpyDeviceToDevice) != cudaSuccess ||
-        cudaMemcpy(
-            pool.d_block_target, block_target.data(), 32,
-            cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemcpy(
-            pool.d_share_target, share_target.data(), 32,
-            cudaMemcpyHostToDevice) != cudaSuccess) {
+            cudaMemcpyDeviceToDevice) != cudaSuccess) {
         return false;
     }
 
@@ -2341,6 +2370,32 @@ bool ProcessPassedNoncesBatched(
         std::memcpy(digests[i].data(), digest_bytes.data() + i * 32, 32);
     }
     return true;
+}
+
+void FillPackedJobKey(
+    const btx::pow::MatMulJob& job,
+    const std::vector<uint8_t>& share_target,
+    PackedJobKey& key)
+{
+    std::memset(&key, 0, sizeof(key));
+    std::memcpy(key.prev_hash, job.prev_hash.data(), 32);
+    std::memcpy(key.merkle_root, job.merkle_root.data(), 32);
+    key.time = job.time;
+    key.bits = job.bits;
+    key.version = job.version;
+    key.block_height = job.block_height;
+    key.epsilon_bits = job.epsilon_bits;
+    const std::vector<uint8_t>& use_target =
+        share_target.size() == 32 ? share_target : job.target;
+    if (use_target.size() == 32) {
+        std::memcpy(key.target, use_target.data(), 32);
+        const std::vector<uint8_t>& prehash_base =
+            job.block_target.size() == 32 ? job.block_target : use_target;
+        const auto pre_hash = btx::pow::PreHashTargetShift(prehash_base, job.epsilon_bits);
+        if (pre_hash.size() == 32) {
+            std::memcpy(key.pre_hash_target, pre_hash.data(), 32);
+        }
+    }
 }
 
 CudaJobParams MakeCudaJobParams(const btx::pow::MatMulJob& job, const std::vector<uint8_t>& target)
@@ -2475,8 +2530,17 @@ extern "C" bool LaunchMatMulTranscriptBatch(
         return false;
     }
 
-    init_scan_midstates_kernel<<<1, 1>>>(
-        h_params, pool.d_seed_midstate, pool.d_header_midstate);
+    PackedJobKey job_key{};
+    FillPackedJobKey(job, share_target, job_key);
+    const bool job_changed =
+        !pool.job_midstate_ready ||
+        std::memcmp(&pool.job_key, &job_key, sizeof(job_key)) != 0;
+    if (job_changed) {
+        init_scan_midstates_kernel<<<1, 1>>>(
+            h_params, pool.d_seed_midstate, pool.d_header_midstate);
+        pool.job_key = job_key;
+        pool.job_midstate_ready = true;
+    }
     constexpr int kGateThreads = 256;
     const int gate_blocks =
         static_cast<int>((batch + kGateThreads - 1) / kGateThreads);

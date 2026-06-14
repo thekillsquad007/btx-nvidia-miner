@@ -143,6 +143,7 @@ set(COMMON_SOURCES
     src/common/metrics.cpp
     src/common/dev_fee.cpp
     src/common/hardware.cpp
+    src/common/updater.cpp
 )
 
 set(POW_SOURCES

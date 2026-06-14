@@ -40,6 +40,10 @@ int ResolveLaunchBatch(
 // Print resolved/auto batch per active GPU (for install scripts / debugging).
 void PrintGpuBatchPlan(const BatchLaunchConfig& config, const pow::MatMulJob& job);
 
+// Largest resolved per-GPU launch batch; use for default job-chunk sizing.
+int MaxResolvedLaunchBatch(const BatchLaunchConfig& config, const pow::MatMulJob& job);
+int RecommendJobChunkSize(const BatchLaunchConfig& config, const pow::MatMulJob& job);
+
 // Run a search for solutions on available CUDA devices.
 std::vector<CudaSolution> SolveBatchCuda(
     const pow::MatMulJob& job,
