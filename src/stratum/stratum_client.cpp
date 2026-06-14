@@ -623,35 +623,29 @@ void StratumClient::Impl::solver_loop() {
                 break;
             }
 
-            {
-                std::lock_guard<std::mutex> lk(job_mutex);
-                if (has_job && !current_job.prev_hash.empty() &&
-                    current_job.prev_hash != job.prev_hash) {
-                    break;
-                }
-            }
-
             const int this_chunk = static_cast<int>(std::min<uint64_t>(
                 static_cast<uint64_t>(chunk), slice_end - cursor));
 
+            bool parent_changed = false;
             {
                 std::lock_guard<std::mutex> lk(job_mutex);
-                if (has_job && current_job.prev_hash != snap.prev_hash) {
-                    break;
-                }
-                if (has_job &&
-                    (current_job.job_id != cached_job_id ||
-                     current_job.prev_hash != cached_prev_hash)) {
+                if (!has_job || current_job.prev_hash != cached_prev_hash) {
+                    parent_changed = true;
+                } else if (current_job.job_id != cached_job_id) {
                     snap = current_job;
                     if (!StratumJobToPowJob(snap, pjob)) {
                         std::cerr << "[stratum] incomplete job " << snap.job_id
                                   << " (missing seeds/target/header fields)" << std::endl;
-                        break;
+                        parent_changed = true;
+                    } else {
+                        cached_job_id = snap.job_id;
+                        cached_prev_hash = snap.prev_hash;
+                        have_block_target = BlockTargetFromBits(snap.bits, block_target);
                     }
-                    cached_job_id = snap.job_id;
-                    cached_prev_hash = snap.prev_hash;
-                    have_block_target = BlockTargetFromBits(snap.bits, block_target);
                 }
+            }
+            if (parent_changed) {
+                break;
             }
 
             auto sols = btx::cuda::SolveBatchCuda(pjob, cursor, this_chunk, config.batch_config);
