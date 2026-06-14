@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.8.0-devel-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          apt-get update
+          apt-get install -y cmake git pkg-config libcurl4-openssl-dev
+
+      - name: Build multi-arch CUDA binary
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+                -DBTX_MINER_ENABLE_CUDA=ON \
+                -DBTX_MINER_BUILD_TESTS=OFF \
+                -DCMAKE_CUDA_ARCHITECTURES="86;89;90;120"
+          cmake --build build -j$(nproc) --target btx-miner
+          ./build/btx-miner --version
+          tar -czf btx-miner-linux-x86_64.tar.gz -C build btx-miner
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: btx-miner-linux-x86_64.tar.gz
+          generate_release_notes: true

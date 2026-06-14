@@ -39,3 +39,4 @@ run_*.sh
 # Large binaries if any prebuilts
 btx-miner
 btx-miner-*
+dist/
