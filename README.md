@@ -15,7 +15,7 @@ High-performance NVIDIA CUDA miner for BTX (btxchain/btx) MatMul Proof-of-Work.
 
 ## Requirements
 
-- NVIDIA GPU (Pascal or newer recommended; sm_61+)
+- NVIDIA GPU (Pascal or newer; sm_60+). Prebuilt releases ship kernels for sm_60 through sm_120 (see `cmake/cuda_architectures.cmake`).
 - CUDA Toolkit 12.0+ (nvcc)
 - CMake 3.20+
 - A C++17 compiler (GCC/Clang/MSVC)
@@ -36,7 +36,7 @@ make -j$(nproc)
 
 See `docs/build.md` for full options (static CUDA, specific arches, ZLUDA dev notes, Docker).
 
-Pre-built binaries (when available) are published on the Releases page.
+Pre-built binaries are published on the Releases page. They are fat binaries for all CUDA-12-supported Pascal–Blackwell architectures (not Maxwell sm_50/52).
 
 ## Usage
 

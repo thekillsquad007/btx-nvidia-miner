@@ -19,7 +19,7 @@ You need the CUDA Toolkit (nvcc) matching your driver.
 mkdir build && cd build
 cmake -DCMAKE_BUILD_TYPE=Release \
       -DBTX_MINER_ENABLE_CUDA=ON \
-      -DCUDA_ARCHS="native" \          # or "86;89;120" etc.
+      -DCUDA_ARCHS="native" \          # or release list in cmake/cuda_architectures.cmake
       ..
 make -j$(nproc)
 ```

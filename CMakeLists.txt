@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(btx-miner LANGUAGES CXX)
 
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/cuda_architectures.cmake)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -74,7 +76,7 @@ if(BTX_MINER_ENABLE_CUDA)
             if(DEFINED CUDA_ARCHS)
                 set(CMAKE_CUDA_ARCHITECTURES "${CUDA_ARCHS}")
             else()
-                set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90;120")
+                set(CMAKE_CUDA_ARCHITECTURES "${BTX_RELEASE_CUDA_ARCHITECTURES}")
             endif()
         endif()
 
@@ -216,7 +218,10 @@ if(BTX_MINER_ENABLE_CUDA)
     if(MSVC)
         target_compile_options(btx-miner PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/W4>)
     else()
-        target_compile_options(btx-miner PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>)
+        target_compile_options(btx-miner PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>
+            $<$<COMPILE_LANGUAGE:CUDA>:--split-compile=0>
+        )
     endif()
 endif()
 

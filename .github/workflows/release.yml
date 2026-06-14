@@ -23,10 +23,10 @@ jobs:
 
       - name: Build multi-arch CUDA binary
         run: |
+          # Default CMAKE_CUDA_ARCHITECTURES = Pascal–Blackwell list in cmake/cuda_architectures.cmake
           cmake -B build -DCMAKE_BUILD_TYPE=Release \
                 -DBTX_MINER_ENABLE_CUDA=ON \
-                -DBTX_MINER_BUILD_TESTS=OFF \
-                -DCMAKE_CUDA_ARCHITECTURES="86;89;90;120"
+                -DBTX_MINER_BUILD_TESTS=OFF
           cmake --build build -j$(nproc) --target btx-miner
           ./build/btx-miner --version
           tar -czf btx-miner-linux-x86_64.tar.gz -C build btx-miner

@@ -5,7 +5,7 @@
 # Usage (recommended one-liner):
 #   curl -fsSL https://raw.githubusercontent.com/thekillsquad007/btx-nvidia-miner/main/install.sh | bash -s -- --address btx1zYOURADDRESS...
 #
-# Downloads a prebuilt CUDA binary (sm_86–sm_120) from GitHub Releases — no compile
+# Downloads a prebuilt CUDA binary (Pascal sm_60+ through Blackwell sm_120) — no compile
 # step on the rig. Only NVIDIA driver + CUDA runtime libraries are required.
 #
 # Optional: --build-from-source to compile locally (needs nvcc + ~2GB build deps).
@@ -20,7 +20,7 @@ REPO_NAME="btx-nvidia-miner"
 REPO_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}.git"
 BINARY_NAME="btx-miner"
 # Pin to the release that ships prebuilt binaries. Bump when publishing a new release.
-RELEASE_VERSION="${BTX_MINER_VERSION:-0.2.33}"
+RELEASE_VERSION="${BTX_MINER_VERSION:-0.2.34}"
 RELEASE_TAG="v${RELEASE_VERSION}"
 RELEASE_ASSET="btx-miner-linux-x86_64.tar.gz"
 RELEASE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${RELEASE_TAG}/${RELEASE_ASSET}"
@@ -52,9 +52,10 @@ Options:
   --uninstall-only        Stop miner and remove previous install, then exit
   -h, --help              This help
 
-Default install downloads a prebuilt binary targeting NVIDIA sm_86, sm_89, sm_90,
-and sm_120 (RTX 30xx / 40xx / 50xx). You only need the NVIDIA driver and CUDA
-runtime — not the full CUDA Toolkit.
+Default install downloads a prebuilt fat binary for Pascal through Blackwell
+(sm_60, sm_61, sm_70, sm_72, sm_75, sm_80, sm_86, sm_87, sm_89, sm_90, sm_100,
+sm_120). Covers GTX 10xx, RTX 20xx–50xx, CMP 170HX, A100/H100, etc. You only need
+the NVIDIA driver and CUDA 12 runtime — not the full CUDA Toolkit.
 
 Each install removes any previous btx-miner binary and stops running miners first.
 
@@ -320,8 +321,8 @@ EOM
         fi
     done < <(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | sort -u)
     if [[ -z "$cuda_arch_list" ]]; then
-        cuda_arch_list="86;89;90;120"
-        echo "WARNING: could not read GPU compute caps; defaulting to ${cuda_arch_list}"
+        cuda_arch_list="60;61;70;72;75;80;86;87;89;90;100;120"
+        echo "WARNING: could not read GPU compute caps; defaulting to release arch list"
     fi
     echo "CUDA arch list: $cuda_arch_list"
 
