@@ -31,8 +31,15 @@ jobs:
           ./build/btx-miner --version
           tar -czf btx-miner-linux-x86_64.tar.gz -C build btx-miner
 
+      - name: Verify binary
+        run: |
+          ./build/btx-miner --version | tee version.txt
+          ldd ./build/btx-miner | head -20
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: btx-miner-linux-x86_64.tar.gz
+          files: |
+            btx-miner-linux-x86_64.tar.gz
+            version.txt
           generate_release_notes: true
