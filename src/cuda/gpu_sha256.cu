@@ -125,6 +125,17 @@ __device__ uint32_t d_ReadLE32(const uint8_t* ptr)
            (uint32_t(ptr[2]) << 16) | (uint32_t(ptr[3]) << 24);
 }
 
+__device__ void d_sha256_pad(uint8_t* block, uint32_t data_len)
+{
+    for (uint32_t i = data_len; i < 64; ++i) {
+        block[i] = 0;
+    }
+    block[data_len] = 0x80;
+    const uint64_t bits = uint64_t(data_len) * 8;
+    block[62] = uint8_t((bits >> 8) & 0xFF);
+    block[63] = uint8_t(bits & 0xFF);
+}
+
 __device__ __forceinline__ uint32_t d_ch(uint32_t x, uint32_t y, uint32_t z)
 {
     return (x & y) ^ (~x & z);
