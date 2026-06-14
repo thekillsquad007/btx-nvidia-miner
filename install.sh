@@ -20,7 +20,7 @@ REPO_NAME="btx-nvidia-miner"
 REPO_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}.git"
 BINARY_NAME="btx-miner"
 # Pin to the release that ships prebuilt binaries. Bump when publishing a new release.
-RELEASE_VERSION="${BTX_MINER_VERSION:-0.2.38}"
+RELEASE_VERSION="${BTX_MINER_VERSION:-0.2.39}"
 RELEASE_TAG="v${RELEASE_VERSION}"
 RELEASE_ASSET="btx-miner-linux-x86_64.tar.gz"
 RELEASE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${RELEASE_TAG}/${RELEASE_ASSET}"
@@ -32,6 +32,8 @@ STATE_DIR="${INSTALL_PREFIX}/share/btx-nvidia-miner"
 
 USER_ADDRESS=""
 POOL_URL="stratum+tcp://stratum.minebtx.com:3333"
+# Fallback when minebtx is down or sends incomplete jobs (auto-failover in btx-miner).
+POOL_FALLBACK_URL="stratum+tcp://stratum.bitminerpool.xyz:3333"
 WORKER_NAME=""
 BUILD_FROM_SOURCE=0
 UNINSTALL_ONLY=0
@@ -43,7 +45,8 @@ btx-nvidia-miner installer
 
 Options:
   --address ADDR          Your BTX payout address (btx1z...). Required for examples.
-  --pool URL              Pool to use in the printed example (default: $POOL_URL)
+  --pool URL              Primary pool in the printed example (default: $POOL_URL)
+  --pool-fallback URL     Backup pool for failover (default: $POOL_FALLBACK_URL)
   --worker NAME           Worker name suffix (default: hostname)
   --prefix DIR            Install prefix (default: \$HOME/.local)
   --version VER           Release to install (default: $RELEASE_VERSION)
@@ -68,6 +71,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --address) USER_ADDRESS="$2"; shift 2 ;;
         --pool)    POOL_URL="$2"; shift 2 ;;
+        --pool-fallback) POOL_FALLBACK_URL="$2"; shift 2 ;;
         --worker)  WORKER_NAME="$2"; shift 2 ;;
         --prefix)  INSTALL_PREFIX="$2"; BIN_DIR="${INSTALL_PREFIX}/bin"; STATE_DIR="${INSTALL_PREFIX}/share/btx-nvidia-miner"; shift 2 ;;
         --version) RELEASE_VERSION="$2"; RELEASE_TAG="v${RELEASE_VERSION}"; shift 2 ;;
@@ -404,9 +408,13 @@ fi
 echo "Quick pool start example (1% dev fee is automatic):"
 echo "  ${BIN_DIR}/${BINARY_NAME} \\"
 echo "    --pool ${POOL_URL} \\"
+echo "    --pool-fallback ${POOL_FALLBACK_URL} \\"
 echo "    --user ${USER_ADDRESS}.${WORKER_NAME} \\"
 echo "    --pass x \\"
 echo "    --devices all"
+echo
+echo "If minebtx is down, btx-miner auto-fails over to BitMinerPool after ~60s."
+echo "Dashboard: https://bitminerpool.xyz/"
 echo
 echo "Mixed-GPU rigs can pin per card (active GPU order from --print-gpu-batch):"
 echo "  ... --batch 0,262144,65536,65536   # auto on GPU0, larger batch on fast cards"
@@ -420,7 +428,7 @@ echo "    --address ${USER_ADDRESS} \\"
 echo "    --devices all"
 echo
 echo "Run in tmux for persistence:"
-echo "  tmux new -d -s btxminer '${BIN_DIR}/${BINARY_NAME} --pool ${POOL_URL} --user ${USER_ADDRESS}.${WORKER_NAME} --pass x --devices all --auto-update'"
+echo "  tmux new -d -s btxminer '${BIN_DIR}/${BINARY_NAME} --pool ${POOL_URL} --pool-fallback ${POOL_FALLBACK_URL} --user ${USER_ADDRESS}.${WORKER_NAME} --pass x --devices all --auto-update'"
 echo
 echo "Manual update check: ${BIN_DIR}/${BINARY_NAME} --check-update"
 echo "Force update:        ${BIN_DIR}/${BINARY_NAME} --update"

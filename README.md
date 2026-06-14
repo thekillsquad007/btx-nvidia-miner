@@ -61,10 +61,13 @@ You can override the percentage with `--dev-fee 0.5` or the `BTX_DEV_FEE_PCT` en
 ```bash
 ./btx-miner \
   --pool stratum+tcp://stratum.minebtx.com:3333 \
+  --pool-fallback stratum+tcp://stratum.bitminerpool.xyz:3333 \
   --user btx1zYourPayoutAddressHere.worker1 \
   --pass x \
   --devices all
 ```
+
+Primary pool is [minebtx](https://minebtx.com/). If it is down or keeps sending incomplete jobs, the miner automatically fails over to [BitMinerPool](https://bitminerpool.xyz/) after about 60 seconds. Disable with `--pool-fallback none` or `BTX_POOL_FALLBACK=none`.
 
 The installer (see below) prints ready-to-run commands with your address and the dev fee already applied.
 

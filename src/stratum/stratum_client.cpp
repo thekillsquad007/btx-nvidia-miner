@@ -14,6 +14,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <csignal>
 #include <cerrno>
@@ -53,6 +54,8 @@ std::string DigestHex(const uint256& digest)
 } // namespace
 
 struct StratumClient::Impl {
+    std::vector<PoolEndpoint> endpoints;
+    size_t endpoint_index = 0;
     std::string host;
     uint16_t port;
     std::string user;
@@ -62,6 +65,8 @@ struct StratumClient::Impl {
     StratumConfig config;
 
     std::atomic<bool> running{false};
+    std::atomic<bool> pool_stalled{false};
+    bool failover_on_reconnect = false;
     int sock = -1;
     std::thread reader_thread;
     std::thread solver_thread;
@@ -110,17 +115,32 @@ struct StratumClient::Impl {
     void submit_share(const StratumJob& job, uint64_t nonce, uint32_t ntime,
                       const uint256& digest, const std::string& submit_user);
     void log(const std::string& msg) const;
+    void apply_active_endpoint();
+    void advance_endpoint(const char* reason);
+    void trigger_pool_failover(const std::string& reason);
 };
 
 StratumClient::StratumClient(const std::string& host, uint16_t port,
                              const std::string& user, const std::string& pass,
                              SolutionCallback on_solution,
                              bool use_tls,
-                             StratumConfig config)
+                             StratumConfig config,
+                             std::vector<PoolEndpoint> fallback_endpoints)
     : impl(std::make_unique<Impl>())
 {
-    impl->host = host;
-    impl->port = port;
+    impl->endpoints.push_back({host, port});
+    for (const auto& fb : fallback_endpoints) {
+        if (fb.host.empty()) continue;
+        const bool duplicate = std::any_of(
+            impl->endpoints.begin(), impl->endpoints.end(),
+            [&](const PoolEndpoint& ep) {
+                return ep.host == fb.host && ep.port == fb.port;
+            });
+        if (!duplicate) {
+            impl->endpoints.push_back(fb);
+        }
+    }
+    impl->apply_active_endpoint();
     impl->user = user;
     impl->pass = pass;
     impl->on_solution = std::move(on_solution);
@@ -136,6 +156,10 @@ void StratumClient::run_forever() {
     impl->running = true;
     while (impl->running) {
         try {
+            if (impl->failover_on_reconnect) {
+                impl->advance_endpoint("pool unavailable");
+                impl->failover_on_reconnect = false;
+            }
             impl->reset_session_state();
             if (!impl->connect_socket()) {
                 throw std::runtime_error("failed to open socket");
@@ -144,10 +168,14 @@ void StratumClient::run_forever() {
 
             if (impl->reader_thread.joinable()) impl->reader_thread.join();
             if (impl->solver_thread.joinable()) impl->solver_thread.join();
+            if (impl->pool_stalled.exchange(false)) {
+                impl->failover_on_reconnect = true;
+            }
         } catch (const std::exception& e) {
             std::cerr << "[stratum] session error: " << e.what() << " — reconnecting in 5s" << std::endl;
             impl->close_socket();
             impl->join_session_threads();
+            impl->failover_on_reconnect = true;
             std::this_thread::sleep_for(std::chrono::seconds(5));
         }
     }
@@ -177,6 +205,32 @@ void StratumClient::Impl::join_session_threads()
     if (metrics_thread.joinable()) metrics_thread.join();
 }
 
+void StratumClient::Impl::apply_active_endpoint()
+{
+    if (endpoints.empty()) return;
+    if (endpoint_index >= endpoints.size()) endpoint_index = 0;
+    host = endpoints[endpoint_index].host;
+    port = endpoints[endpoint_index].port;
+}
+
+void StratumClient::Impl::advance_endpoint(const char* reason)
+{
+    if (endpoints.size() <= 1) return;
+    const size_t prev = endpoint_index;
+    endpoint_index = (endpoint_index + 1) % endpoints.size();
+    apply_active_endpoint();
+    if (endpoint_index != prev) {
+        LogLine(std::string("[stratum] failover (") + reason + ") -> " + host + ":" + std::to_string(port));
+    }
+}
+
+void StratumClient::Impl::trigger_pool_failover(const std::string& reason)
+{
+    if (!running || pool_stalled.exchange(true)) return;
+    std::cerr << "[stratum] " << reason << " — switching pool" << std::endl;
+    close_socket();
+}
+
 void StratumClient::Impl::reset_session_state()
 {
     subscribed = false;
@@ -186,6 +240,7 @@ void StratumClient::Impl::reset_session_state()
     local_nonce_cursor = 0;
     slice_in_progress.store(false);
     slices_processed = 0;
+    pool_stalled.store(false);
 }
 
 void StratumClient::Impl::log(const std::string& msg) const
@@ -535,6 +590,9 @@ void StratumClient::Impl::handle_notify(const StratumJob& incoming)
 void StratumClient::Impl::solver_loop() {
     LogLine("[stratum] solver loop ready");
     int job_wait_polls = 0;
+    int incomplete_job_polls = 0;
+    constexpr int kStallPollLimit = 240; // 240 * 250ms ~= 60s of incomplete jobs
+    constexpr int kNoNotifyPollLimit = 300; // 300 * 200ms = 60s waiting for first notify
     try {
     while (running) {
         StratumJob job;
@@ -551,6 +609,10 @@ void StratumClient::Impl::solver_loop() {
             ++job_wait_polls;
             if (job_wait_polls == 1 || job_wait_polls % 50 == 0) {
                 LogLine("[stratum] waiting for mining.notify from pool...");
+            }
+            if (job_wait_polls >= kNoNotifyPollLimit && endpoints.size() > 1) {
+                trigger_pool_failover("no mining.notify from pool for 60s");
+                break;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
             continue;
@@ -609,14 +671,21 @@ void StratumClient::Impl::solver_loop() {
         std::string cached_job_id;
         std::string cached_prev_hash;
         if (!StratumJobToPowJob(snap, pjob)) {
+            ++incomplete_job_polls;
             if (slices_processed == 0 || slices_processed % 20 == 0) {
                 std::cerr << "[stratum] waiting for complete job " << snap.job_id
                           << " (missing seeds/target/header fields)" << std::endl;
+            }
+            if (incomplete_job_polls >= kStallPollLimit && endpoints.size() > 1) {
+                trigger_pool_failover("incomplete jobs from pool for 60s");
+                slice_in_progress.store(false);
+                break;
             }
             slice_in_progress.store(false);
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
             continue;
         }
+        incomplete_job_polls = 0;
         cached_job_id = snap.job_id;
         cached_prev_hash = snap.prev_hash;
         have_block_target = BlockTargetFromBits(snap.bits, block_target);

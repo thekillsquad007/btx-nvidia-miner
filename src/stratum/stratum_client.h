@@ -48,13 +48,19 @@ struct StratumConfig {
     bool verbose = false;
 };
 
+struct PoolEndpoint {
+    std::string host;
+    uint16_t port = 3333;
+};
+
 class StratumClient {
 public:
     StratumClient(const std::string& host, uint16_t port,
                   const std::string& user, const std::string& pass,
                   SolutionCallback on_solution,
                   bool use_tls = false,
-                  StratumConfig config = {});
+                  StratumConfig config = {},
+                  std::vector<PoolEndpoint> fallback_endpoints = {});
 
     ~StratumClient();
 

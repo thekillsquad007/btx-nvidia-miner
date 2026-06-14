@@ -1968,6 +1968,7 @@ struct DeviceLaunchPool {
     size_t nonce_cap = 0;
     size_t ws_bytes = 0;
     size_t digest_cap = 0;
+    uint32_t last_gate_passed = 0;
     PackedJobKey job_key{};
     bool job_midstate_ready = false;
 };
@@ -2524,33 +2525,54 @@ bool WaitGateCount(DeviceLaunchPool& pool, uint32_t& passed)
 
 bool CollectScatteredHits(
     DeviceLaunchPool& pool,
+    int device,
     size_t launch_batch,
-    uint32_t passed,
     std::vector<btx::uint256>& out_digests,
     std::vector<bool>& out_found)
 {
     out_digests.resize(launch_batch);
     out_found.assign(launch_batch, false);
 
-    std::vector<uint8_t> h_found(launch_batch, 0);
+    const uint32_t passed = pool.last_gate_passed;
+    if (passed == 0) {
+        return true;
+    }
+    if (device < 0 || device >= 16) {
+        return false;
+    }
+    BatchedMatMulPool& bpool = g_batched_pool[device];
+
+    std::vector<uint32_t> indices(passed);
+    std::vector<int32_t> results(passed);
+    std::vector<uint8_t> digests(static_cast<size_t>(passed) * 32);
+
     if (cudaMemcpy(
-            h_found.data(), pool.d_found, launch_batch,
+            indices.data(), pool.d_passed_indices, passed * sizeof(uint32_t),
+            cudaMemcpyDeviceToHost) != cudaSuccess) {
+        return false;
+    }
+    if (cudaMemcpy(
+            results.data(), bpool.d_results, passed * sizeof(int32_t),
+            cudaMemcpyDeviceToHost) != cudaSuccess) {
+        return false;
+    }
+    if (cudaMemcpy(
+            digests.data(), bpool.d_digests, static_cast<size_t>(passed) * 32,
             cudaMemcpyDeviceToHost) != cudaSuccess) {
         return false;
     }
 
-    for (size_t i = 0; i < launch_batch; ++i) {
-        if (!h_found[i]) {
+    for (uint32_t i = 0; i < passed; ++i) {
+        if (results[i] == 0) {
             continue;
         }
-        out_found[i] = true;
-        if (cudaMemcpy(
-                out_digests[i].data(), pool.d_digests + i * 32, 32,
-                cudaMemcpyDeviceToHost) != cudaSuccess) {
-            return false;
+        const uint32_t idx = indices[i];
+        if (idx >= launch_batch) {
+            continue;
         }
+        out_found[idx] = true;
+        std::memcpy(out_digests[idx].data(), digests.data() + static_cast<size_t>(i) * 32, 32);
     }
-    (void)passed;
     return true;
 }
 
@@ -2631,7 +2653,7 @@ extern "C" bool CudaCollectTranscriptBatch(
         return false;
     }
     pool.matmul_in_flight = false;
-    return CollectScatteredHits(pool, launch_batch, 0, out_digests, out_found);
+    return CollectScatteredHits(pool, device, launch_batch, out_digests, out_found);
 }
 
 extern "C" void CudaFinalizeTranscriptPipeline(int device)
@@ -2747,13 +2769,10 @@ extern "C" bool LaunchMatMulTranscriptBatch(
             return false;
         }
     }
+    pool.last_gate_passed = passed;
 
     if (passed > 0) {
-        BatchedMatMulPool& bpool = g_batched_pool[device];
         if (!EnsureBatchedPool(device, passed, job.n, job.r, job.b)) {
-            return false;
-        }
-        if (cudaMemsetAsync(pool.d_found, 0, batch, pool.matmul_stream) != cudaSuccess) {
             return false;
         }
         if (!ProcessPassedNoncesBatched(
@@ -2762,17 +2781,12 @@ extern "C" bool LaunchMatMulTranscriptBatch(
                 pool.matmul_stream, false, nullptr, nullptr)) {
             return false;
         }
-        const uint32_t scatter_blocks = (passed + 255) / 256;
-        scatter_passed_hits_kernel<<<scatter_blocks, 256, 0, pool.matmul_stream>>>(
-            pool.d_passed_indices, bpool.d_results, bpool.d_digests, passed,
-            pool.d_found, pool.d_digests, batch);
-        if (cudaGetLastError() != cudaSuccess) {
-            return false;
-        }
         if (cudaEventRecord(pool.matmul_done, pool.matmul_stream) != cudaSuccess) {
             return false;
         }
         pool.matmul_in_flight = true;
+    } else {
+        pool.matmul_in_flight = false;
     }
 
     if (pool.pending_next_gate) {

@@ -22,7 +22,9 @@ Usage:
 
 Modes:
   --solo                    Solo mine against local btxd (getblocktemplate)
-  --pool <url>              Pool mine (e.g. stratum+tcp://stratum.minebtx.com:3333)
+  --pool <url>              Pool mine (default: stratum+tcp://stratum.minebtx.com:3333)
+  --pool-fallback <url>     Backup pool when primary is down (default: bitminerpool.xyz)
+                            Set to "none" to disable. Env: BTX_POOL_FALLBACK
 
 Common:
   --user <worker>           Full worker name for pool (address.worker) — required
@@ -137,6 +139,8 @@ int main(int argc, char** argv)
 {
     std::string mode;
     std::string pool_url;
+    std::string pool_fallback_url;
+    bool pool_fallback_disabled = false;
     std::string user;
     std::string pass = "x";
     bool do_bench = false;
@@ -164,6 +168,15 @@ int main(int argc, char** argv)
         if (a == "--pool") {
             mode = "pool";
             if (i+1 < argc && argv[i+1][0] != '-') pool_url = argv[++i];
+        }
+        if (a == "--pool-fallback") {
+            if (i+1 < argc && argv[i+1][0] != '-') {
+                pool_fallback_url = argv[++i];
+                if (pool_fallback_url == "none" || pool_fallback_url == "off") {
+                    pool_fallback_disabled = true;
+                    pool_fallback_url.clear();
+                }
+            }
         }
         if ((a == "--user" || a == "--address") && i+1 < argc) user = argv[++i];
         if (a == "--pass" && i+1 < argc) pass = argv[++i];
@@ -283,6 +296,17 @@ int main(int argc, char** argv)
             return 1;
         }
         if (pool_url.empty()) pool_url = "stratum+tcp://stratum.minebtx.com:3333";
+        if (pool_fallback_url.empty() && !pool_fallback_disabled) {
+            if (const char* env_fb = std::getenv("BTX_POOL_FALLBACK")) {
+                pool_fallback_url = env_fb;
+                if (pool_fallback_url == "none" || pool_fallback_url == "off") {
+                    pool_fallback_disabled = true;
+                    pool_fallback_url.clear();
+                }
+            } else {
+                pool_fallback_url = "stratum+tcp://stratum.bitminerpool.xyz:3333";
+            }
+        }
 
         std::string host;
         uint16_t port = 3333;
@@ -291,7 +315,24 @@ int main(int argc, char** argv)
             return 1;
         }
 
-        std::cout << "btx-miner v" << btx::common::kMinerVersion << " — pool mining " << host << ":" << port << " as " << user << std::endl;
+        std::vector<btx::stratum::PoolEndpoint> fallback_endpoints;
+        if (!pool_fallback_disabled && !pool_fallback_url.empty()) {
+            std::string fb_host;
+            uint16_t fb_port = 3333;
+            if (!btx::stratum::ParsePoolUrl(pool_fallback_url, fb_host, fb_port)) {
+                std::cerr << "Error: invalid pool fallback URL: " << pool_fallback_url << std::endl;
+                return 1;
+            }
+            if (fb_host != host || fb_port != port) {
+                fallback_endpoints.push_back({fb_host, fb_port});
+            }
+        }
+
+        std::cout << "btx-miner v" << btx::common::kMinerVersion << " — pool mining " << host << ":" << port << " as " << user;
+        if (!fallback_endpoints.empty()) {
+            std::cout << " (fallback " << fallback_endpoints[0].host << ":" << fallback_endpoints[0].port << ")";
+        }
+        std::cout << std::endl;
         if (intensity < 10000) {
             std::cerr << "WARNING: --intensity " << intensity
                       << " limits each slice to only " << intensity << " nonces (~"
@@ -342,7 +383,7 @@ int main(int argc, char** argv)
         cfg.slice_max_seconds = slice_seconds > 0.0 ? slice_seconds : 5.0;
         cfg.verbose = verbose;
 
-        btx::stratum::StratumClient client(host, port, user, pass, on_sol, false, cfg);
+        btx::stratum::StratumClient client(host, port, user, pass, on_sol, false, cfg, fallback_endpoints);
         client.run_forever();
         return 0;
     }

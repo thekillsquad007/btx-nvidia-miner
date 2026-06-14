@@ -97,20 +97,20 @@ int AutoBatchCapForDevice(int device)
         return 262144;
     }
     if (total >= 20ULL * 1024 * 1024 * 1024) {
-        return 131072;
+        return 262144;
     }
     if (total >= 12ULL * 1024 * 1024 * 1024) {
-        return 65536;
+        return 131072;
     }
     if (total >= 8ULL * 1024 * 1024 * 1024) {
-        return 49152;
+        return 65536;
     }
     return 32768;
 }
 
 int AutoBatchSizeForDevice(int device, const pow::MatMulJob& job, int max_cap)
 {
-    constexpr size_t kReserveBytes = 192 * 1024 * 1024;
+    constexpr size_t kReserveBytes = 128 * 1024 * 1024;
     const size_t free_bytes = GetDeviceFreeMemBytes(device);
     if (free_bytes <= kReserveBytes) {
         return 1024;
@@ -168,7 +168,7 @@ int MaxResolvedLaunchBatch(const BatchLaunchConfig& config, const pow::MatMulJob
 
 int RecommendJobChunkSize(const BatchLaunchConfig& config, const pow::MatMulJob& job)
 {
-    return std::max(65536, MaxResolvedLaunchBatch(config, job));
+    return std::max(131072, MaxResolvedLaunchBatch(config, job) * 2);
 }
 
 void PrintGpuBatchPlan(const BatchLaunchConfig& config, const pow::MatMulJob& job)
