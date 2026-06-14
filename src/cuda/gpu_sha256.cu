@@ -463,6 +463,8 @@ __global__ void DeriveNoiseSeedsKernel(
     const uint8_t* sigma_batch,
     uint8_t* noise_seeds,
     uint8_t* compress_seeds,
+    uint32_t* noise_midstates,
+    uint32_t* compress_midstates,
     uint32_t batch_size)
 {
     const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -475,14 +477,21 @@ __global__ void DeriveNoiseSeedsKernel(
     uint8_t seed_out[32];
     d_DeriveNoiseSeed(sigma, seed_idx, seed_out);
     if (seed_idx < 4) {
-        uint8_t* out = noise_seeds + (size_t(nonce_idx) * 4 + seed_idx) * 32;
+        const size_t slot = size_t(nonce_idx) * 4 + seed_idx;
+        uint8_t* out = noise_seeds + slot * 32;
         for (int i = 0; i < 32; ++i) {
             out[i] = seed_out[i];
+        }
+        if (noise_midstates) {
+            d_compute_seed_midstate(seed_out, noise_midstates + slot * 16);
         }
     } else {
         uint8_t* out = compress_seeds + size_t(nonce_idx) * 32;
         for (int i = 0; i < 32; ++i) {
             out[i] = seed_out[i];
+        }
+        if (compress_midstates) {
+            d_compute_seed_midstate(seed_out, compress_midstates + size_t(nonce_idx) * 16);
         }
     }
 }
@@ -654,6 +663,40 @@ __device__ void d_finalize_product_digest(
     d_sha256_message(inner, 32, digest_data);
 }
 
+__device__ int32_t d_compare_digest_targets(
+    const uint8_t* digest,
+    const uint8_t* block_target,
+    const uint8_t* share_target)
+{
+    bool le_block = true;
+    bool le_share = true;
+    for (int i = 31; i >= 0; --i) {
+        if (digest[i] < block_target[i]) {
+            break;
+        }
+        if (digest[i] > block_target[i]) {
+            le_block = false;
+            break;
+        }
+    }
+    for (int i = 31; i >= 0; --i) {
+        if (digest[i] < share_target[i]) {
+            break;
+        }
+        if (digest[i] > share_target[i]) {
+            le_share = false;
+            break;
+        }
+    }
+    if (le_block) {
+        return 2;
+    }
+    if (le_share) {
+        return 1;
+    }
+    return 0;
+}
+
 __global__ void HashTranscriptKernel(
     const Element* compressed_words,
     const uint8_t* sigma_batch,
@@ -675,6 +718,93 @@ __global__ void HashTranscriptKernel(
 
     uint8_t* out = digest_batch + size_t(nonce_idx) * 32;
     d_finalize_product_digest(sigma_data, c_prime_data, n, b, out);
+}
+
+__global__ void HashTranscriptCompareKernel(
+    const Element* compressed_words,
+    const uint8_t* sigma_batch,
+    uint32_t words_per_nonce,
+    uint32_t n,
+    uint32_t b,
+    uint32_t batch_size,
+    const uint8_t* block_target,
+    const uint8_t* share_target,
+    uint8_t* digest_batch,
+    int32_t* results)
+{
+    const uint32_t nonce_idx = blockIdx.x;
+    if (nonce_idx >= batch_size) {
+        return;
+    }
+    const Element* words = compressed_words + size_t(nonce_idx) * words_per_nonce;
+    const uint8_t* sigma_data = sigma_batch + size_t(nonce_idx) * 32;
+
+    uint8_t digest[32];
+    uint8_t c_prime_data[32];
+    d_hash_matrix_words(words, words_per_nonce, c_prime_data);
+    d_finalize_product_digest(sigma_data, c_prime_data, n, b, digest);
+
+    const int32_t cmp = d_compare_digest_targets(digest, block_target, share_target);
+    results[nonce_idx] = cmp;
+    if (cmp != 0 && digest_batch) {
+        uint8_t* out = digest_batch + size_t(nonce_idx) * 32;
+        for (int i = 0; i < 32; ++i) {
+            out[i] = digest[i];
+        }
+    }
+}
+
+__global__ void GenerateAllNoiseKernel(
+    const uint8_t* noise_seeds,
+    const uint32_t* seed_midstates,
+    uint32_t batch_size,
+    uint32_t noise_left_elements,
+    uint32_t noise_right_elements,
+    Element* output_el,
+    Element* output_er,
+    Element* output_fl,
+    Element* output_fr)
+{
+    const size_t gid = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t left_plane = size_t(batch_size) * noise_left_elements;
+    const size_t right_plane = size_t(batch_size) * noise_right_elements;
+
+    uint32_t seed_index = 0;
+    uint32_t num_elements = noise_left_elements;
+    Element* output = output_el;
+    size_t local = gid;
+
+    if (gid < left_plane) {
+        seed_index = 0;
+    } else if ((local = gid - left_plane) < right_plane) {
+        seed_index = 1;
+        num_elements = noise_right_elements;
+        output = output_er;
+    } else if ((local = gid - left_plane - right_plane) < left_plane) {
+        seed_index = 2;
+        output = output_fl;
+    } else if ((local = gid - left_plane - right_plane - left_plane) < right_plane) {
+        seed_index = 3;
+        num_elements = noise_right_elements;
+        output = output_fr;
+    } else {
+        return;
+    }
+
+    const uint32_t nonce_idx = static_cast<uint32_t>(local / num_elements);
+    const uint32_t elem_idx = static_cast<uint32_t>(local % num_elements);
+    if (nonce_idx >= batch_size) {
+        return;
+    }
+
+    const size_t seed_slot = size_t(nonce_idx) * 4 + seed_index;
+    const uint8_t* seed = noise_seeds + seed_slot * 32;
+    const uint32_t* midstate =
+        seed_midstates ? seed_midstates + seed_slot * 16 : nullptr;
+    const Element val = midstate
+        ? d_from_oracle_midstate(midstate, seed, elem_idx)
+        : d_from_oracle_fast(seed, elem_idx);
+    output[size_t(nonce_idx) * num_elements + elem_idx] = val;
 }
 
 __global__ void CompareDigestsKernel(
@@ -793,6 +923,8 @@ void DeriveNoiseSeedsKernel_launch(
     const uint8_t* sigma_batch,
     uint8_t* noise_seeds,
     uint8_t* compress_seeds,
+    uint32_t* noise_midstates,
+    uint32_t* compress_midstates,
     uint32_t batch_size,
     cudaStream_t stream)
 {
@@ -801,7 +933,31 @@ void DeriveNoiseSeedsKernel_launch(
     const uint32_t seed_total = batch_size * 5;
     const uint32_t seed_blocks = (seed_total + seed_threads - 1) / seed_threads;
     DeriveNoiseSeedsKernel<<<seed_blocks, seed_threads, 0, stream>>>(
-        sigma_batch, noise_seeds, compress_seeds, batch_size);
+        sigma_batch, noise_seeds, compress_seeds,
+        noise_midstates, compress_midstates, batch_size);
+}
+
+void GenerateAllNoiseKernel_launch(
+    const uint8_t* noise_seeds,
+    const uint32_t* seed_midstates,
+    uint32_t batch_size,
+    uint32_t noise_left_elements,
+    uint32_t noise_right_elements,
+    Element* output_el,
+    Element* output_er,
+    Element* output_fl,
+    Element* output_fr,
+    cudaStream_t stream)
+{
+    EnsureKInitialized();
+    const size_t total_el =
+        2 * size_t(batch_size) * noise_left_elements +
+        2 * size_t(batch_size) * noise_right_elements;
+    const uint32_t gen_blocks = static_cast<uint32_t>((total_el + 255) / 256);
+    GenerateAllNoiseKernel<<<gen_blocks, 256, 0, stream>>>(
+        noise_seeds, seed_midstates, batch_size,
+        noise_left_elements, noise_right_elements,
+        output_el, output_er, output_fl, output_fr);
 }
 
 void PrecomputeSeedMidstatesKernel_launch(
@@ -846,6 +1002,24 @@ void GenerateCompressKernel_launch(
     const uint32_t gen_blocks = (total_el + 255) / 256;
     GenerateCompressKernel<<<gen_blocks, 256, 0, stream>>>(
         compress_seeds, seed_midstates, batch_size, num_elements, output);
+}
+
+void HashTranscriptCompareKernel_launch(
+    const Element* compressed_words,
+    const uint8_t* sigma_batch,
+    uint32_t words_per_nonce,
+    uint32_t n,
+    uint32_t b,
+    uint32_t batch_size,
+    const uint8_t* block_target,
+    const uint8_t* share_target,
+    uint8_t* digest_batch,
+    int32_t* results,
+    cudaStream_t stream)
+{
+    HashTranscriptCompareKernel<<<batch_size, 1, 0, stream>>>(
+        compressed_words, sigma_batch, words_per_nonce, n, b, batch_size,
+        block_target, share_target, digest_batch, results);
 }
 
 void HashTranscriptKernel_launch(

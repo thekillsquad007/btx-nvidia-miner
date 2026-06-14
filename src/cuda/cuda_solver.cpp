@@ -213,6 +213,13 @@ extern "C" bool LaunchMatMulTranscriptBatch(
     std::vector<uint256>& out_digests,
     std::vector<bool>& out_found
 );
+extern "C" void CudaSetPrefetchGate(int device, uint64_t next_start_nonce, size_t next_batch);
+extern "C" bool CudaCollectTranscriptBatch(
+    int device,
+    size_t launch_batch,
+    std::vector<uint256>& out_digests,
+    std::vector<bool>& out_found);
+extern "C" void CudaFinalizeTranscriptPipeline(int device);
 #endif
 
 std::vector<CudaSolution> CollectHits(
@@ -255,24 +262,56 @@ std::vector<CudaSolution> SolveOnDevice(
     uint64_t current_nonce = start_nonce;
     uint64_t remaining = count;
 
+    bool pipeline_pending = false;
+    uint64_t pending_start = 0;
+    size_t pending_batch = 0;
+    std::vector<uint256> pending_digests;
+    std::vector<bool> pending_found;
+
     while (remaining > 0) {
         const size_t batch = static_cast<size_t>(
             std::min<uint64_t>(remaining, static_cast<uint64_t>(launch_batch)));
 
-        std::vector<uint256> digests(batch);
-        std::vector<bool> found(batch, false);
-
-        if (!LaunchMatMulTranscriptBatch(
-                dev, job, current_nonce, batch, job.target, digests, found)) {
-            break;
+        if (pipeline_pending) {
+            if (!CudaCollectTranscriptBatch(
+                    dev, pending_batch, pending_digests, pending_found)) {
+                break;
+            }
+            auto hits = CollectHits(job, pending_start, pending_digests, pending_found);
+            solutions.insert(solutions.end(), hits.begin(), hits.end());
+            pipeline_pending = false;
         }
 
-        auto hits = CollectHits(job, current_nonce, digests, found);
-        solutions.insert(solutions.end(), hits.begin(), hits.end());
+        const uint64_t next_start = current_nonce + batch;
+        const uint64_t next_remaining = remaining - batch;
+        if (next_remaining > 0) {
+            const size_t next_batch = static_cast<size_t>(
+                std::min<uint64_t>(next_remaining, static_cast<uint64_t>(launch_batch)));
+            CudaSetPrefetchGate(dev, next_start, next_batch);
+        }
+
+        pending_digests.assign(batch, uint256{});
+        pending_found.assign(batch, false);
+        if (!LaunchMatMulTranscriptBatch(
+                dev, job, current_nonce, batch, job.target,
+                pending_digests, pending_found)) {
+            break;
+        }
+        pipeline_pending = true;
+        pending_start = current_nonce;
+        pending_batch = batch;
 
         current_nonce += batch;
         remaining -= batch;
     }
+
+    if (pipeline_pending) {
+        if (CudaCollectTranscriptBatch(dev, pending_batch, pending_digests, pending_found)) {
+            auto hits = CollectHits(job, pending_start, pending_digests, pending_found);
+            solutions.insert(solutions.end(), hits.begin(), hits.end());
+        }
+    }
+    CudaFinalizeTranscriptPipeline(dev);
 
     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();

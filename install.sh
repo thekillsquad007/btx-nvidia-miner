@@ -20,7 +20,7 @@ REPO_NAME="btx-nvidia-miner"
 REPO_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}.git"
 BINARY_NAME="btx-miner"
 # Pin to the release that ships prebuilt binaries. Bump when publishing a new release.
-RELEASE_VERSION="${BTX_MINER_VERSION:-0.2.37}"
+RELEASE_VERSION="${BTX_MINER_VERSION:-0.2.38}"
 RELEASE_TAG="v${RELEASE_VERSION}"
 RELEASE_ASSET="btx-miner-linux-x86_64.tar.gz"
 RELEASE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${RELEASE_TAG}/${RELEASE_ASSET}"

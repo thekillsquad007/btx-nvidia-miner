@@ -1675,6 +1675,34 @@ __global__ void sigma_gate_kernel(
     }
 }
 
+__global__ void scatter_passed_hits_kernel(
+    const uint32_t* __restrict__ passed_indices,
+    const int32_t* __restrict__ passed_results,
+    const uint8_t* __restrict__ passed_digests,
+    uint32_t passed_count,
+    uint8_t* __restrict__ out_found,
+    uint8_t* __restrict__ out_digests,
+    size_t launch_batch)
+{
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= passed_count) {
+        return;
+    }
+    if (passed_results[i] == 0) {
+        return;
+    }
+    const uint32_t idx = passed_indices[i];
+    if (idx >= launch_batch) {
+        return;
+    }
+    out_found[idx] = 1;
+    uint8_t* out = out_digests + size_t(idx) * 32;
+    const uint8_t* in = passed_digests + size_t(i) * 32;
+    for (int j = 0; j < 32; ++j) {
+        out[j] = in[j];
+    }
+}
+
 __global__ void batch_perturb_matrix_kernel(
     const uint32_t* __restrict__ base,
     const uint32_t* __restrict__ noise_left,
@@ -1928,7 +1956,15 @@ struct DeviceLaunchPool {
     uint32_t* d_seed_midstate = nullptr;
     uint32_t* d_header_midstate = nullptr;
     uint32_t h_gate_count = 0;
-    cudaStream_t stream = nullptr;
+    cudaStream_t gate_stream = nullptr;
+    cudaStream_t matmul_stream = nullptr;
+    cudaEvent_t gate_done = nullptr;
+    cudaEvent_t matmul_done = nullptr;
+    bool matmul_in_flight = false;
+    bool gate_prefetched = false;
+    bool pending_next_gate = false;
+    uint64_t pending_start_nonce = 0;
+    size_t pending_batch = 0;
     size_t nonce_cap = 0;
     size_t ws_bytes = 0;
     size_t digest_cap = 0;
@@ -1940,9 +1976,6 @@ DeviceLaunchPool g_launch_pool[16];
 
 struct BatchedMatMulPool {
     int device = -1;
-    uint8_t* d_seed_a = nullptr;
-    uint8_t* d_seed_b = nullptr;
-    uint8_t* d_sigma = nullptr;
     uint8_t* d_noise_seeds = nullptr;
     uint8_t* d_compress_seeds = nullptr;
     uint32_t* d_seed_midstates = nullptr;
@@ -1976,9 +2009,6 @@ void FreeBatchedPool(BatchedMatMulPool& pool)
     if (pool.stream) {
         cudaStreamDestroy(pool.stream);
     }
-    cudaFree(pool.d_seed_a);
-    cudaFree(pool.d_seed_b);
-    cudaFree(pool.d_sigma);
     cudaFree(pool.d_noise_seeds);
     cudaFree(pool.d_compress_seeds);
     cudaFree(pool.d_seed_midstates);
@@ -2032,9 +2062,6 @@ bool EnsureBatchedPool(
     const size_t words = batch * static_cast<size_t>(n / bsz) * (n / bsz);
 
     const bool ok =
-        CudaAlloc(pool.d_seed_a, batch * 32) &&
-        CudaAlloc(pool.d_seed_b, batch * 32) &&
-        CudaAlloc(pool.d_sigma, batch * 32) &&
         CudaAlloc(pool.d_noise_seeds, batch * 4 * 32) &&
         CudaAlloc(pool.d_compress_seeds, batch * 32) &&
         CudaAlloc(pool.d_seed_midstates, batch * 16 * 2) &&
@@ -2064,8 +2091,17 @@ bool EnsureBatchedPool(
 
 void FreeLaunchPool(DeviceLaunchPool& pool)
 {
-    if (pool.stream) {
-        cudaStreamDestroy(pool.stream);
+    if (pool.gate_stream) {
+        cudaStreamDestroy(pool.gate_stream);
+    }
+    if (pool.matmul_stream) {
+        cudaStreamDestroy(pool.matmul_stream);
+    }
+    if (pool.gate_done) {
+        cudaEventDestroy(pool.gate_done);
+    }
+    if (pool.matmul_done) {
+        cudaEventDestroy(pool.matmul_done);
     }
     if (pool.d_nonces) cudaFree(pool.d_nonces);
     if (pool.d_workspace) cudaFree(pool.d_workspace);
@@ -2145,13 +2181,26 @@ bool EnsureLaunchPool(int device, size_t batch, size_t ws_bytes)
     if (pool.d_nonces && pool.d_workspace && pool.d_digests && pool.d_found &&
         pool.d_gate_count && pool.d_passed_indices && pool.d_passed_sigma &&
         pool.d_passed_seed_a && pool.d_passed_seed_b &&
-        pool.d_seed_midstate && pool.d_header_midstate && !pool.stream) {
-        cudaStreamCreate(&pool.stream);
+        pool.d_seed_midstate && pool.d_header_midstate) {
+        if (!pool.gate_stream) {
+            cudaStreamCreate(&pool.gate_stream);
+        }
+        if (!pool.matmul_stream) {
+            cudaStreamCreate(&pool.matmul_stream);
+        }
+        if (!pool.gate_done) {
+            cudaEventCreateWithFlags(&pool.gate_done, cudaEventDisableTiming);
+        }
+        if (!pool.matmul_done) {
+            cudaEventCreateWithFlags(&pool.matmul_done, cudaEventDisableTiming);
+        }
     }
     return pool.d_nonces && pool.d_workspace && pool.d_digests && pool.d_found &&
            pool.d_gate_count && pool.d_passed_indices && pool.d_passed_sigma &&
            pool.d_passed_seed_a && pool.d_passed_seed_b &&
-           pool.d_seed_midstate && pool.d_header_midstate && pool.stream;
+           pool.d_seed_midstate && pool.d_header_midstate &&
+           pool.gate_stream && pool.matmul_stream &&
+           pool.gate_done && pool.matmul_done;
 }
 
 void FreeMatrixCache(DeviceMatrixCache& cache)
@@ -2246,8 +2295,10 @@ bool ProcessPassedNoncesBatched(
     const uint8_t* d_seed_a,
     const uint8_t* d_seed_b,
     const uint8_t* d_sigma,
-    std::vector<btx::uint256>& digests,
-    std::vector<uint8_t>& found)
+    cudaStream_t stream,
+    bool sync_at_end,
+    std::vector<btx::uint256>* digests_out,
+    std::vector<uint8_t>* found_out)
 {
     if (batch == 0) {
         return true;
@@ -2281,18 +2332,6 @@ bool ProcessPassedNoncesBatched(
         pool.targets_ready = true;
     }
 
-    if (cudaMemcpy(
-            pool.d_seed_a, d_seed_a, batch * 32,
-            cudaMemcpyDeviceToDevice) != cudaSuccess ||
-        cudaMemcpy(
-            pool.d_seed_b, d_seed_b, batch * 32,
-            cudaMemcpyDeviceToDevice) != cudaSuccess ||
-        cudaMemcpy(
-            pool.d_sigma, d_sigma, batch * 32,
-            cudaMemcpyDeviceToDevice) != cudaSuccess) {
-        return false;
-    }
-
     const uint32_t n = job.n;
     const uint32_t r = job.r;
     const uint32_t bsz = job.b;
@@ -2304,36 +2343,24 @@ bool ProcessPassedNoncesBatched(
     const uint32_t noise_right_elements = r * n;
     const uint32_t compress_elements = bsz * bsz;
 
-    const cudaStream_t stream = pool.stream;
     const uint32_t batch_u32 = static_cast<uint32_t>(batch);
 
     gpasha::PrecomputeSeedMidstatesKernel_launch(
-        pool.d_seed_a, pool.d_seed_midstates, batch_u32, stream);
+        d_seed_a, pool.d_seed_midstates, batch_u32, stream);
     gpasha::PrecomputeSeedMidstatesKernel_launch(
-        pool.d_seed_b, pool.d_seed_midstates + batch_u32 * 16, batch_u32, stream);
+        d_seed_b, pool.d_seed_midstates + batch_u32 * 16, batch_u32, stream);
     gpasha::GenerateMatrixKernel_launch(
-        pool.d_seed_a, pool.d_seed_midstates, batch_u32, n, pool.d_base_a, stream);
+        d_seed_a, pool.d_seed_midstates, batch_u32, n, pool.d_base_a, stream);
     gpasha::GenerateMatrixKernel_launch(
-        pool.d_seed_b, pool.d_seed_midstates + batch_u32 * 16, batch_u32, n,
+        d_seed_b, pool.d_seed_midstates + batch_u32 * 16, batch_u32, n,
         pool.d_base_b, stream);
     gpasha::DeriveNoiseSeedsKernel_launch(
-        pool.d_sigma, pool.d_noise_seeds, pool.d_compress_seeds, batch_u32, stream);
-    gpasha::PrecomputeSeedMidstatesKernel_launch(
-        pool.d_noise_seeds, pool.d_noise_midstates, batch_u32 * 4, stream);
-    gpasha::PrecomputeSeedMidstatesKernel_launch(
-        pool.d_compress_seeds, pool.d_compress_midstates, batch_u32, stream);
-    gpasha::GenerateNoiseKernel_launch(
+        d_sigma, pool.d_noise_seeds, pool.d_compress_seeds,
+        pool.d_noise_midstates, pool.d_compress_midstates, batch_u32, stream);
+    gpasha::GenerateAllNoiseKernel_launch(
         pool.d_noise_seeds, pool.d_noise_midstates, batch_u32,
-        noise_left_elements, 0, pool.d_noise_el, stream);
-    gpasha::GenerateNoiseKernel_launch(
-        pool.d_noise_seeds, pool.d_noise_midstates, batch_u32,
-        noise_right_elements, 1, pool.d_noise_er, stream);
-    gpasha::GenerateNoiseKernel_launch(
-        pool.d_noise_seeds, pool.d_noise_midstates, batch_u32,
-        noise_left_elements, 2, pool.d_noise_fl, stream);
-    gpasha::GenerateNoiseKernel_launch(
-        pool.d_noise_seeds, pool.d_noise_midstates, batch_u32,
-        noise_right_elements, 3, pool.d_noise_fr, stream);
+        noise_left_elements, noise_right_elements,
+        pool.d_noise_el, pool.d_noise_er, pool.d_noise_fl, pool.d_noise_fr, stream);
     gpasha::GenerateCompressKernel_launch(
         pool.d_compress_seeds, pool.d_compress_midstates, batch_u32,
         compress_elements, pool.d_compress, stream);
@@ -2370,22 +2397,28 @@ bool ProcessPassedNoncesBatched(
             pool.d_words);
     }
 
-    gpasha::HashTranscriptKernel_launch(
-        pool.d_words, pool.d_sigma, words_per_nonce, n, bsz,
-        batch_u32, pool.d_digests, stream);
-    gpasha::CompareDigestsKernel_launch(
-        pool.d_digests, pool.d_block_target, pool.d_share_target,
-        batch_u32, pool.d_results, stream);
+    gpasha::HashTranscriptCompareKernel_launch(
+        pool.d_words, d_sigma, words_per_nonce, n, bsz, batch_u32,
+        pool.d_block_target, pool.d_share_target,
+        pool.d_digests, pool.d_results, stream);
 
-    cudaError_t err = cudaStreamSynchronize(stream);
-    if (err != cudaSuccess) {
-        err = cudaGetLastError();
-    }
-    if (err != cudaSuccess) {
-        std::fprintf(
-            stderr, "batched CUDA transcript failed: %s\n",
-            cudaGetErrorString(err));
+    if (sync_at_end) {
+        cudaError_t err = cudaStreamSynchronize(stream);
+        if (err != cudaSuccess) {
+            err = cudaGetLastError();
+        }
+        if (err != cudaSuccess) {
+            std::fprintf(
+                stderr, "batched CUDA transcript failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
+    } else if (cudaGetLastError() != cudaSuccess) {
         return false;
+    }
+
+    if (!digests_out || !found_out) {
+        return true;
     }
 
     std::vector<int32_t> results(batch);
@@ -2395,19 +2428,103 @@ bool ProcessPassedNoncesBatched(
         return false;
     }
 
-    digests.resize(batch);
-    found.assign(batch, 0);
+    digests_out->resize(batch);
+    found_out->assign(batch, 0);
     for (size_t i = 0; i < batch; ++i) {
         if (results[i] == 0) {
             continue;
         }
-        found[i] = 1;
+        (*found_out)[i] = 1;
         if (cudaMemcpy(
-                digests[i].data(), pool.d_digests + i * 32, 32,
+                (*digests_out)[i].data(), pool.d_digests + i * 32, 32,
                 cudaMemcpyDeviceToHost) != cudaSuccess) {
             return false;
         }
     }
+    return true;
+}
+
+bool LaunchGateForBatch(
+    DeviceLaunchPool& pool,
+    const CudaJobParams& h_params,
+    const btx::pow::MatMulJob& job,
+    const std::vector<uint8_t>& share_target,
+    uint64_t start_nonce,
+    size_t batch)
+{
+    if (cudaMemsetAsync(pool.d_gate_count, 0, sizeof(uint32_t), pool.gate_stream) !=
+        cudaSuccess) {
+        return false;
+    }
+
+    PackedJobKey job_key{};
+    FillPackedJobKey(job, share_target, job_key);
+    const bool job_changed =
+        !pool.job_midstate_ready ||
+        std::memcmp(&pool.job_key, &job_key, sizeof(job_key)) != 0;
+    if (job_changed) {
+        init_scan_midstates_kernel<<<1, 1, 0, pool.gate_stream>>>(
+            h_params, pool.d_seed_midstate, pool.d_header_midstate);
+        pool.job_key = job_key;
+        pool.job_midstate_ready = true;
+    }
+
+    constexpr int kGateThreads = 256;
+    const int gate_blocks =
+        static_cast<int>((batch + kGateThreads - 1) / kGateThreads);
+    sigma_gate_kernel<<<gate_blocks, kGateThreads, 0, pool.gate_stream>>>(
+        h_params, start_nonce, batch,
+        pool.d_seed_midstate, pool.d_header_midstate, pool.d_gate_count,
+        pool.d_passed_indices, pool.d_passed_sigma,
+        pool.d_passed_seed_a, pool.d_passed_seed_b);
+
+    if (cudaMemcpyAsync(
+            &pool.h_gate_count, pool.d_gate_count, sizeof(uint32_t),
+            cudaMemcpyDeviceToHost, pool.gate_stream) != cudaSuccess) {
+        return false;
+    }
+    return cudaEventRecord(pool.gate_done, pool.gate_stream) == cudaSuccess &&
+           cudaGetLastError() == cudaSuccess;
+}
+
+bool WaitGateCount(DeviceLaunchPool& pool, uint32_t& passed)
+{
+    if (cudaEventSynchronize(pool.gate_done) != cudaSuccess) {
+        return false;
+    }
+    passed = pool.h_gate_count;
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool CollectScatteredHits(
+    DeviceLaunchPool& pool,
+    size_t launch_batch,
+    uint32_t passed,
+    std::vector<btx::uint256>& out_digests,
+    std::vector<bool>& out_found)
+{
+    out_digests.resize(launch_batch);
+    out_found.assign(launch_batch, false);
+
+    std::vector<uint8_t> h_found(launch_batch, 0);
+    if (cudaMemcpy(
+            h_found.data(), pool.d_found, launch_batch,
+            cudaMemcpyDeviceToHost) != cudaSuccess) {
+        return false;
+    }
+
+    for (size_t i = 0; i < launch_batch; ++i) {
+        if (!h_found[i]) {
+            continue;
+        }
+        out_found[i] = true;
+        if (cudaMemcpy(
+                out_digests[i].data(), pool.d_digests + i * 32, 32,
+                cudaMemcpyDeviceToHost) != cudaSuccess) {
+            return false;
+        }
+    }
+    (void)passed;
     return true;
 }
 
@@ -2482,6 +2599,57 @@ size_t WorkspaceUint32Count(uint32_t n, uint32_t r, uint32_t bsz, bool use_v2_se
 }
 
 } // namespace
+
+extern "C" void CudaSetPrefetchGate(
+    int device,
+    uint64_t next_start_nonce,
+    size_t next_batch)
+{
+    if (device < 0 || device >= 16) {
+        return;
+    }
+    DeviceLaunchPool& pool = g_launch_pool[device];
+    pool.pending_next_gate = next_batch > 0;
+    pool.pending_start_nonce = next_start_nonce;
+    pool.pending_batch = next_batch;
+}
+
+extern "C" bool CudaCollectTranscriptBatch(
+    int device,
+    size_t launch_batch,
+    std::vector<btx::uint256>& out_digests,
+    std::vector<bool>& out_found)
+{
+    if (device < 0 || device >= 16) {
+        return false;
+    }
+    DeviceLaunchPool& pool = g_launch_pool[device];
+    if (!pool.matmul_in_flight) {
+        return true;
+    }
+    if (cudaEventSynchronize(pool.matmul_done) != cudaSuccess) {
+        return false;
+    }
+    pool.matmul_in_flight = false;
+    return CollectScatteredHits(pool, launch_batch, 0, out_digests, out_found);
+}
+
+extern "C" void CudaFinalizeTranscriptPipeline(int device)
+{
+    if (device < 0 || device >= 16) {
+        return;
+    }
+    DeviceLaunchPool& pool = g_launch_pool[device];
+    if (pool.matmul_in_flight && pool.matmul_done) {
+        cudaEventSynchronize(pool.matmul_done);
+        pool.matmul_in_flight = false;
+    }
+    if (pool.gate_prefetched && pool.gate_done) {
+        cudaEventSynchronize(pool.gate_done);
+        pool.gate_prefetched = false;
+    }
+    pool.pending_next_gate = false;
+}
 
 extern "C" bool LaunchMatMulTranscriptBatch(
     int device,
@@ -2565,72 +2733,58 @@ extern "C" bool LaunchMatMulTranscriptBatch(
         return true;
     }
 
-    const cudaStream_t gate_stream = pool.stream;
-    if (cudaMemsetAsync(pool.d_gate_count, 0, sizeof(uint32_t), gate_stream) != cudaSuccess) {
-        return false;
-    }
-
-    PackedJobKey job_key{};
-    FillPackedJobKey(job, share_target, job_key);
-    const bool job_changed =
-        !pool.job_midstate_ready ||
-        std::memcmp(&pool.job_key, &job_key, sizeof(job_key)) != 0;
-    if (job_changed) {
-        init_scan_midstates_kernel<<<1, 1, 0, gate_stream>>>(
-            h_params, pool.d_seed_midstate, pool.d_header_midstate);
-        pool.job_key = job_key;
-        pool.job_midstate_ready = true;
-    }
-    constexpr int kGateThreads = 256;
-    const int gate_blocks =
-        static_cast<int>((batch + kGateThreads - 1) / kGateThreads);
-    sigma_gate_kernel<<<gate_blocks, kGateThreads, 0, gate_stream>>>(
-        h_params, start_nonce, batch,
-        pool.d_seed_midstate, pool.d_header_midstate, pool.d_gate_count,
-        pool.d_passed_indices, pool.d_passed_sigma,
-        pool.d_passed_seed_a, pool.d_passed_seed_b);
-
-    if (cudaMemcpyAsync(
-            &pool.h_gate_count, pool.d_gate_count, sizeof(uint32_t),
-            cudaMemcpyDeviceToHost, gate_stream) != cudaSuccess) {
-        return false;
-    }
-    if (cudaStreamSynchronize(gate_stream) != cudaSuccess ||
-        cudaGetLastError() != cudaSuccess) {
-        return false;
-    }
-
-    const uint32_t passed = pool.h_gate_count;
-    if (passed == 0) {
-        return true;
-    }
-
-    std::vector<uint32_t> passed_indices(passed);
-    if (cudaMemcpyAsync(
-            passed_indices.data(), pool.d_passed_indices,
-            passed * sizeof(uint32_t), cudaMemcpyDeviceToHost,
-            gate_stream) != cudaSuccess ||
-        cudaStreamSynchronize(gate_stream) != cudaSuccess) {
-        return false;
-    }
-
-    std::vector<btx::uint256> passed_digests;
-    std::vector<uint8_t> passed_found;
-    if (!ProcessPassedNoncesBatched(
-            device, job, share_target, passed,
-            pool.d_passed_seed_a, pool.d_passed_seed_b, pool.d_passed_sigma,
-            passed_digests, passed_found)) {
-        return false;
-    }
-
-    for (size_t i = 0; i < passed; ++i) {
-        const size_t original_index = passed_indices[i];
-        if (original_index >= batch) {
+    uint32_t passed = 0;
+    if (pool.gate_prefetched) {
+        pool.gate_prefetched = false;
+        if (!WaitGateCount(pool, passed)) {
             return false;
         }
-        out_found[original_index] = passed_found[i] != 0;
-        out_digests[original_index] = passed_digests[i];
+    } else {
+        if (!LaunchGateForBatch(pool, h_params, job, share_target, start_nonce, batch)) {
+            return false;
+        }
+        if (!WaitGateCount(pool, passed)) {
+            return false;
+        }
     }
+
+    if (passed > 0) {
+        BatchedMatMulPool& bpool = g_batched_pool[device];
+        if (!EnsureBatchedPool(device, passed, job.n, job.r, job.b)) {
+            return false;
+        }
+        if (cudaMemsetAsync(pool.d_found, 0, batch, pool.matmul_stream) != cudaSuccess) {
+            return false;
+        }
+        if (!ProcessPassedNoncesBatched(
+                device, job, share_target, passed,
+                pool.d_passed_seed_a, pool.d_passed_seed_b, pool.d_passed_sigma,
+                pool.matmul_stream, false, nullptr, nullptr)) {
+            return false;
+        }
+        const uint32_t scatter_blocks = (passed + 255) / 256;
+        scatter_passed_hits_kernel<<<scatter_blocks, 256, 0, pool.matmul_stream>>>(
+            pool.d_passed_indices, bpool.d_results, bpool.d_digests, passed,
+            pool.d_found, pool.d_digests, batch);
+        if (cudaGetLastError() != cudaSuccess) {
+            return false;
+        }
+        if (cudaEventRecord(pool.matmul_done, pool.matmul_stream) != cudaSuccess) {
+            return false;
+        }
+        pool.matmul_in_flight = true;
+    }
+
+    if (pool.pending_next_gate) {
+        if (!LaunchGateForBatch(
+                pool, h_params, job, share_target,
+                pool.pending_start_nonce, pool.pending_batch)) {
+            return false;
+        }
+        pool.gate_prefetched = true;
+        pool.pending_next_gate = false;
+    }
+
     return true;
 }
 
@@ -2653,6 +2807,10 @@ extern "C" bool CudaVerifyAgainstCpu(
     if (!LaunchMatMulTranscriptBatch(device, job, nonce, 1, target, digests, found)) {
         return false;
     }
+    if (!CudaCollectTranscriptBatch(device, 1, digests, found)) {
+        return false;
+    }
+    CudaFinalizeTranscriptPipeline(device);
 
     btx::uint256 cpu_digest;
     btx::pow::VerifySolution(job, nonce, job.time, cpu_digest);
