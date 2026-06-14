@@ -110,23 +110,30 @@ int AutoBatchCapForDevice(int device)
 
 int AutoBatchSizeForDevice(int device, const pow::MatMulJob& job, int max_cap)
 {
-    const size_t per_launch = LaunchBatchBytes(job, 1);
-    if (per_launch == 0) {
-        return 256;
-    }
-
     constexpr size_t kReserveBytes = 192 * 1024 * 1024;
     const size_t free_bytes = GetDeviceFreeMemBytes(device);
     if (free_bytes <= kReserveBytes) {
-        return 256;
+        return 1024;
     }
 
     const int cap = max_cap > 0 ? max_cap : AutoBatchCapForDevice(device);
     const size_t usable = static_cast<size_t>((free_bytes - kReserveBytes) * 0.85);
-    int batch = static_cast<int>(usable / LaunchBatchBytes(job, 1));
-    batch = std::max(1024, batch);
-    batch = std::min(batch, cap);
-    return batch;
+
+    // Gate-path VRAM is mostly fixed pools + O(batch) gate buffers — not
+    // LaunchBatchBytes(job,1) per nonce. Binary-search the largest batch that fits.
+    int lo = 1024;
+    int hi = cap;
+    int best = 1024;
+    while (lo <= hi) {
+        const int mid = lo + (hi - lo) / 2;
+        if (LaunchBatchBytes(job, static_cast<size_t>(mid)) <= usable) {
+            best = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return best;
 }
 
 int ResolveLaunchBatch(
