@@ -632,12 +632,16 @@ void StratumClient::Impl::solver_loop() {
                 if (!has_job || current_job.prev_hash != cached_prev_hash) {
                     parent_changed = true;
                 } else if (current_job.job_id != cached_job_id) {
-                    snap = current_job;
-                    if (!StratumJobToPowJob(snap, pjob)) {
-                        std::cerr << "[stratum] incomplete job " << snap.job_id
-                                  << " (missing seeds/target/header fields)" << std::endl;
-                        parent_changed = true;
+                    const StratumJob candidate = current_job;
+                    pow::MatMulJob candidate_job;
+                    if (!StratumJobToPowJob(candidate, candidate_job)) {
+                        if (config.verbose) {
+                            std::cerr << "[stratum] ignoring partial notify job="
+                                      << candidate.job_id << std::endl;
+                        }
                     } else {
+                        snap = candidate;
+                        pjob = candidate_job;
                         cached_job_id = snap.job_id;
                         cached_prev_hash = snap.prev_hash;
                         have_block_target = BlockTargetFromBits(snap.bits, block_target);
