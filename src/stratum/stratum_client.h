@@ -64,7 +64,7 @@ public:
 
     ~StratumClient();
 
-    void run_forever();   // blocks, reconnects on error
+    void run_forever();   // blocks; auto-reconnects when the pool drops
 
     void stop();
 
