@@ -2,6 +2,7 @@
 
 #include "common/dev_fee.h"
 #include "common/hardware.h"
+#include "common/updater.h"
 #include "common/version.h"
 #include "cuda/cuda_solver.h"
 #include "cuda/cuda_device.h"
@@ -66,6 +67,7 @@ struct StratumClient::Impl {
 
     std::atomic<bool> running{false};
     std::atomic<bool> session_ended{false};
+    std::atomic<bool> update_restart_requested{false};
     bool rotate_pool_on_reconnect = false;
     int sock = -1;
     std::thread reader_thread;
@@ -198,6 +200,10 @@ void StratumClient::stop() {
     impl->handshake_cv.notify_all();
     impl->close_socket();
     impl->join_session_threads();
+}
+
+bool StratumClient::restart_for_update() const {
+    return impl->update_restart_requested.load();
 }
 
 void StratumClient::Impl::close_socket()
@@ -523,8 +529,30 @@ void StratumClient::Impl::metrics_loop()
     sleep_until(std::chrono::steady_clock::now() +
                 std::chrono::milliseconds(initial_ms));
 
+    auto last_update_check = std::chrono::steady_clock::now();
     while (running && !session_ended.load()) {
         try {
+            if (config.auto_update && config.auto_update_interval_sec > 0.0) {
+                const auto now = std::chrono::steady_clock::now();
+                const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                    now - last_update_check).count();
+                if (elapsed >= static_cast<int64_t>(config.auto_update_interval_sec)) {
+                    last_update_check = now;
+                    const auto info = common::CheckForUpdate();
+                    if (info.update_available) {
+                        std::string err;
+                        LogLine("[update] Installing v" + info.latest_version +
+                                " (from v" + info.current_version + ")...");
+                        if (common::InstallUpdate(info, err)) {
+                            update_restart_requested.store(true);
+                            end_session("miner update installed", false);
+                            return;
+                        }
+                        LogLine("[update] failed (non-fatal): " + err);
+                    }
+                }
+            }
+
             double solver_nps = 0.0;
             for (const auto& sample : btx::cuda::GetGpuHashrateSnapshot()) {
                 solver_nps += sample.average_nonces_per_sec;
@@ -758,11 +786,14 @@ void StratumClient::Impl::solver_loop() {
 
                 const uint32_t submit_ntime = s.ntime ? s.ntime : snap.time;
 
+                bool job_rotated = false;
                 {
                     std::lock_guard<std::mutex> lk(job_mutex);
-                    if (!has_job || current_job.job_id != snap.job_id) {
-                        continue;
-                    }
+                    job_rotated = !has_job || current_job.job_id != snap.job_id;
+                }
+                if (job_rotated && config.verbose) {
+                    LogLine("[stratum] submitting share for prior job=" + snap.job_id +
+                            " (pool validates staleness)");
                 }
 
                 uint256 cpu_digest;

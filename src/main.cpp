@@ -37,7 +37,8 @@ Common:
   --job-chunk <n>           Nonces per outer solver call (default: auto from GPU batch)
   --check-update            Print whether a newer release is available
   --update                  Download and install latest release, then restart
-  --auto-update             Check for updates on startup (pool mode)
+  --auto-update             Check for updates on startup; re-check every 30m while mining
+                            Interval: BTX_AUTO_UPDATE_INTERVAL_SEC (default 1800)
   --slice-seconds <n>       Time-limit each mining slice in seconds (default: 5)
   --verbose                 Extra stratum debug logging
   --benchmark               Run a short throughput test (CPU ref + CUDA if available)
@@ -382,9 +383,25 @@ int main(int argc, char** argv)
         cfg.job_chunk_size = resolved_job_chunk;
         cfg.slice_max_seconds = slice_seconds > 0.0 ? slice_seconds : 5.0;
         cfg.verbose = verbose;
+        cfg.auto_update = auto_update;
+        if (const char* interval = std::getenv("BTX_AUTO_UPDATE_INTERVAL_SEC")) {
+            cfg.auto_update_interval_sec = std::atof(interval);
+        }
 
         btx::stratum::StratumClient client(host, port, user, pass, on_sol, false, cfg, fallback_endpoints);
         client.run_forever();
+        if (client.restart_for_update()) {
+            std::cout << "[update] Restarting with new binary..." << std::endl;
+            std::vector<std::string> relaunch;
+            const std::string exe = btx::common::GetExecutablePath();
+            relaunch.push_back(exe.empty() ? argv[0] : exe);
+            for (int i = 1; i < argc; ++i) {
+                const std::string arg = argv[i];
+                if (arg == "--auto-update") continue;
+                relaunch.push_back(arg);
+            }
+            btx::common::ReexecCurrentProcess(relaunch);
+        }
         return 0;
     }
 

@@ -44,6 +44,21 @@ static btx::pow::MatMulJob MakeV2Job()
     return job;
 }
 
+static btx::pow::MatMulJob MakeV3Job()
+{
+    auto job = MakeV2Job();
+    job.block_height = btx::pow::kMatMulSeedV3Height;
+    job.time = 1781098511u;
+    job.bits = 0x1d14bd00U;
+    job.parent_mtp = 1780000000LL;
+    job.has_parent_mtp = true;
+    uint256_from_hex(job.prev_hash,
+        "e41768fe0c8ed2d40b967c981e3af7cddf6fc495f844563836756fa76a0d2ec9");
+    uint256_from_hex(job.merkle_root,
+        "fe14530b149adfa21a45f7d2666f3c2dbef7296333398ba208ab77ea6b44a6e2");
+    return job;
+}
+
 static void VerifyNonceRange(const btx::pow::MatMulJob& job, uint64_t start, uint64_t count)
 {
     for (uint64_t nonce = start; nonce < start + count; ++nonce) {
@@ -56,6 +71,9 @@ int main()
     auto v2 = MakeV2Job();
     VerifyNonceRange(v2, 1000000, 64);
 
-    std::cout << "CUDA PoW matches CPU reference (legacy + v2 sample nonces)." << std::endl;
+    auto v3 = MakeV3Job();
+    VerifyNonceRange(v3, 2000000, 64);
+
+    std::cout << "CUDA PoW matches CPU reference (legacy + v2 + v3 sample nonces)." << std::endl;
     return 0;
 }

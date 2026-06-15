@@ -46,6 +46,8 @@ struct StratumConfig {
     int job_chunk_size = 0;             // 0 = 65536 outer chunk (amdbtx-style)
     double slice_max_seconds = 5.0;     // time-limit slices (dexbtx-style)
     bool verbose = false;
+    bool auto_update = false;           // periodic release check while mining
+    double auto_update_interval_sec = 1800.0;
 };
 
 struct PoolEndpoint {
@@ -67,6 +69,8 @@ public:
     void run_forever();   // blocks; auto-reconnects when the pool drops
 
     void stop();
+
+    bool restart_for_update() const;
 
 private:
     // Implementation details (sockets, reader, solver loop) in .cpp

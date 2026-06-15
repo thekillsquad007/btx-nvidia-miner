@@ -1938,6 +1938,7 @@ struct PackedJobKey {
     int32_t version = 0;
     uint32_t block_height = 0;
     uint32_t epsilon_bits = 0;
+    int64_t parent_mtp = 0;
     uint8_t target[32];
     uint8_t pre_hash_target[32];
 };
@@ -2458,6 +2459,7 @@ void FillPackedJobKey(
     key.version = job.version;
     key.block_height = job.block_height;
     key.epsilon_bits = job.epsilon_bits;
+    key.parent_mtp = job.has_parent_mtp ? job.parent_mtp : 0;
     const std::vector<uint8_t>& use_target =
         share_target.size() == 32 ? share_target : job.target;
     if (use_target.size() == 32) {
