@@ -2,7 +2,7 @@
 
 High-performance NVIDIA CUDA miner for BTX (btxchain/btx) MatMul Proof-of-Work.
 
-**Optimized for matrix multiplication (512×512 over F_{2^31-1})**. GPU-first design with excellent multi-GPU scaling. Supports both solo mining (JSON-RPC against a local `btxd`) and pool mining against `stratum+tcp://stratum.minebtx.com:3333`.
+**Optimized for matrix multiplication (512×512 over F_{2^31-1})**. GPU-first design with excellent multi-GPU scaling. Supports both solo mining (JSON-RPC against a local `btxd`) and pool mining against `stratum+tcp://stratum.bitminerpool.xyz:3333`.
 
 ## Features
 
@@ -60,14 +60,14 @@ You can override the percentage with `--dev-fee 0.5` or the `BTX_DEV_FEE_PCT` en
 
 ```bash
 ./btx-miner \
-  --pool stratum+tcp://stratum.minebtx.com:3333 \
-  --pool-fallback stratum+tcp://stratum.bitminerpool.xyz:3333 \
+  --pool stratum+tcp://stratum.bitminerpool.xyz:3333 \
+  --pool-fallback stratum+tcp://stratum.minebtx.com:3333 \
   --user btx1zYourPayoutAddressHere.worker1 \
   --pass x \
   --devices all
 ```
 
-Primary pool is [minebtx](https://minebtx.com/). If it is down or keeps sending incomplete jobs, the miner automatically fails over to [BitMinerPool](https://bitminerpool.xyz/) after about 60 seconds. Disable with `--pool-fallback none` or `BTX_POOL_FALLBACK=none`.
+Primary pool is [BitMinerPool](https://bitminerpool.xyz/). If it is down or keeps sending incomplete jobs, the miner automatically fails over to [minebtx](https://minebtx.com/) after about 60 seconds. Disable with `--pool-fallback none` or `BTX_POOL_FALLBACK=none`.
 
 The installer (see below) prints ready-to-run commands with your address and the dev fee already applied.
 
