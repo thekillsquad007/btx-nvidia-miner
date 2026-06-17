@@ -75,8 +75,8 @@ static void test_parse_pool_url()
 {
     std::string host;
     uint16_t port = 0;
-    assert(btx::stratum::ParsePoolUrl("stratum+tcp://stratum.minebtx.com:3333", host, port));
-    assert(host == "stratum.minebtx.com");
+    assert(btx::stratum::ParsePoolUrl("stratum+tcp://stratum.bitminerpool.xyz:3333", host, port));
+    assert(host == "stratum.bitminerpool.xyz");
     assert(port == 3333);
 }
 

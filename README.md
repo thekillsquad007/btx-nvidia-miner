@@ -9,7 +9,7 @@ High-performance NVIDIA CUDA miner for BTX (btxchain/btx) MatMul Proof-of-Work.
 - Native CUDA kernels for the full MatMul PoW (seed expansion, low-rank noise, blocked transcript accumulation + compression, SHA-256 transcript digest).
 - Multi-GPU support with automatic device discovery and load distribution.
 - Solo mining via `getblocktemplate` / `submitblock`.
-- Stratum client compatible with the minebtx.com pool (stratum/2.0-matmul protocol).
+- Stratum client compatible with [BitMinerPool](https://bitminerpool.xyz) (stratum/2.0-matmul protocol).
 - CPU reference implementation for verification and environments without CUDA.
 - Low CPU overhead — designed to keep GPUs at >95% utilization.
 
@@ -56,18 +56,17 @@ You can override the percentage with `--dev-fee 0.5` or the `BTX_DEV_FEE_PCT` en
   --devices 0,1
 ```
 
-### Pool mining (minebtx)
+### Pool mining (BitMinerPool)
 
 ```bash
 ./btx-miner \
   --pool stratum+tcp://stratum.bitminerpool.xyz:3333 \
-  --pool-fallback stratum+tcp://stratum.minebtx.com:3333 \
   --user btx1zYourPayoutAddressHere.worker1 \
   --pass x \
   --devices all
 ```
 
-Primary pool is [BitMinerPool](https://bitminerpool.xyz/). If it is down or keeps sending incomplete jobs, the miner automatically fails over to [minebtx](https://minebtx.com/) after about 60 seconds. Disable with `--pool-fallback none` or `BTX_POOL_FALLBACK=none`.
+Default pool is [BitMinerPool](https://bitminerpool.xyz/). Add `--pool-fallback stratum+tcp://other.pool:3333` for automatic failover after about 60 seconds, or set `BTX_POOL_FALLBACK=none` to disable.
 
 The installer (see below) prints ready-to-run commands with your address and the dev fee already applied.
 

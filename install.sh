@@ -31,9 +31,9 @@ BIN_DIR="${INSTALL_PREFIX}/bin"
 STATE_DIR="${INSTALL_PREFIX}/share/btx-nvidia-miner"
 
 USER_ADDRESS=""
-POOL_URL="stratum+tcp://stratum.minebtx.com:3333"
-# Fallback when minebtx is down or sends incomplete jobs (auto-failover in btx-miner).
-POOL_FALLBACK_URL="stratum+tcp://stratum.bitminerpool.xyz:3333"
+POOL_URL="stratum+tcp://stratum.bitminerpool.xyz:3333"
+# Optional backup pool (auto-failover in btx-miner). Set to "none" to disable.
+POOL_FALLBACK_URL="none"
 WORKER_NAME=""
 BUILD_FROM_SOURCE=0
 UNINSTALL_ONLY=0
@@ -413,7 +413,7 @@ echo "    --user ${USER_ADDRESS}.${WORKER_NAME} \\"
 echo "    --pass x \\"
 echo "    --devices all"
 echo
-echo "If minebtx is down, btx-miner auto-fails over to BitMinerPool after ~60s."
+echo "Set --pool-fallback to add a backup pool for auto-failover after ~60s."
 echo "Dashboard: https://bitminerpool.xyz/"
 echo
 echo "Mixed-GPU rigs can pin per card (active GPU order from --print-gpu-batch):"

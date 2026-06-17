@@ -22,8 +22,8 @@ Usage:
 
 Modes:
   --solo                    Solo mine against local btxd (getblocktemplate)
-  --pool <url>              Pool mine (default: stratum+tcp://stratum.minebtx.com:3333)
-  --pool-fallback <url>     Backup pool when primary is down (default: bitminerpool.xyz)
+  --pool <url>              Pool mine (default: stratum+tcp://stratum.bitminerpool.xyz:3333)
+  --pool-fallback <url>     Backup pool when primary is down (default: none)
                             Set to "none" to disable. Env: BTX_POOL_FALLBACK
 
 Common:
@@ -296,7 +296,7 @@ int main(int argc, char** argv)
             std::cerr << "Error: --user <btx1z... .worker> is required for pool mode" << std::endl;
             return 1;
         }
-        if (pool_url.empty()) pool_url = "stratum+tcp://stratum.minebtx.com:3333";
+        if (pool_url.empty()) pool_url = "stratum+tcp://stratum.bitminerpool.xyz:3333";
         if (pool_fallback_url.empty() && !pool_fallback_disabled) {
             if (const char* env_fb = std::getenv("BTX_POOL_FALLBACK")) {
                 pool_fallback_url = env_fb;
@@ -304,8 +304,6 @@ int main(int argc, char** argv)
                     pool_fallback_disabled = true;
                     pool_fallback_url.clear();
                 }
-            } else {
-                pool_fallback_url = "stratum+tcp://stratum.bitminerpool.xyz:3333";
             }
         }
 

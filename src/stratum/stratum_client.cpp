@@ -505,7 +505,7 @@ void StratumClient::Impl::handle_set_canonical_name(const std::string& line)
             msg << " gpu=" << item.gpu_uuid;
         }
         LogLine(msg.str());
-        LogLine("[stratum] dashboard: https://pool.minebtx.com/");
+        LogLine("[stratum] dashboard: https://bitminerpool.xyz/");
     }
 }
 
