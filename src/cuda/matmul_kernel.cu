@@ -13,6 +13,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -22,6 +23,36 @@ namespace {
 
 constexpr uint32_t kFieldModulus = 0x7FFFFFFFU;
 constexpr int kBlockThreads = 256;
+
+__constant__ uint32_t g_batched_active_count = 0;
+__constant__ uint32_t g_gate_nonce_count = 0;
+__constant__ uint64_t g_gate_nonce_start = 0;
+
+__device__ __forceinline__ uint32_t d_active_batched_count(uint32_t launch_batch)
+{
+    const uint32_t active = g_batched_active_count;
+    return active != 0U ? active : launch_batch;
+}
+
+__device__ __forceinline__ uint32_t d_active_gate_count(uint32_t launch_count)
+{
+    const uint32_t active = g_gate_nonce_count;
+    return active != 0U ? active : launch_count;
+}
+
+__host__ __forceinline__ uint32_t BucketBatchSize(uint32_t batch)
+{
+    if (batch <= 64U) {
+        return 64U;
+    }
+    batch -= 1U;
+    batch |= batch >> 1U;
+    batch |= batch >> 2U;
+    batch |= batch >> 4U;
+    batch |= batch >> 8U;
+    batch |= batch >> 16U;
+    return batch + 1U;
+}
 
 struct CudaJobParams {
     int32_t version;
@@ -683,6 +714,45 @@ __device__ void d_matmul_seed_fast(
     d_sha256_bytes_from_midstate(seed_midstate, message, len, out_internal);
 }
 
+__device__ void d_matmul_seeds_pair_fast(
+    const uint32_t seed_midstate[8],
+    const CudaJobParams& job,
+    uint64_t nonce64,
+    uint8_t out_a[32],
+    uint8_t out_b[32])
+{
+    uint8_t message[128];
+    const uint32_t len = d_build_matmul_seed_message(job, nonce64, 0U, message);
+    d_sha256_bytes_from_midstate(seed_midstate, message, len, out_a);
+    message[len - 1U] = 1U;
+    d_sha256_bytes_from_midstate(seed_midstate, message, len, out_b);
+}
+
+__device__ void d_sha256_32_fast(const uint8_t data[32], uint8_t out[32])
+{
+    uint32_t w[16] = {};
+    #pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) {
+        w[i] = (static_cast<uint32_t>(data[i * 4U]) << 24U) |
+               (static_cast<uint32_t>(data[i * 4U + 1U]) << 16U) |
+               (static_cast<uint32_t>(data[i * 4U + 2U]) << 8U) |
+               static_cast<uint32_t>(data[i * 4U + 3U]);
+    }
+    w[8] = 0x80000000U;
+    w[15] = 256U;
+
+    uint32_t state[8];
+    d_sha256_init_words(state);
+    d_sha256_compress(state, w);
+    #pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) {
+        out[i * 4U] = static_cast<uint8_t>((state[i] >> 24U) & 0xffU);
+        out[i * 4U + 1U] = static_cast<uint8_t>((state[i] >> 16U) & 0xffU);
+        out[i * 4U + 2U] = static_cast<uint8_t>((state[i] >> 8U) & 0xffU);
+        out[i * 4U + 3U] = static_cast<uint8_t>(state[i] & 0xffU);
+    }
+}
+
 __device__ void d_derive_sigma_fast(
     const uint32_t header_midstate[8],
     const CudaJobParams& job,
@@ -695,7 +765,7 @@ __device__ void d_derive_sigma_fast(
     const uint32_t len = d_build_header_hash_message(job, nonce64, seed_a, seed_b, message);
     uint8_t header_hash[32];
     d_sha256_bytes_from_midstate(header_midstate, message, len, header_hash);
-    d_sha256_bytes(header_hash, 32U, sigma_internal);
+    d_sha256_32_fast(header_hash, sigma_internal);
 }
 
 __device__ void d_init_scan_midstates(
@@ -1742,12 +1812,16 @@ __global__ void sigma_gate_kernel(
     uint8_t seed_b[32];
     uint8_t sigma[32];
 
-    if (idx < nonce_count) {
-        const uint64_t nonce = nonce_start + idx;
+    const size_t active_count =
+        static_cast<size_t>(d_active_gate_count(static_cast<uint32_t>(nonce_count)));
+    if (idx < active_count) {
+        const uint64_t base_nonce =
+            g_gate_nonce_start != 0ULL ? g_gate_nonce_start : nonce_start;
+        const uint64_t nonce = base_nonce + idx;
 
         if (params.block_height >= 125000) {
-            d_matmul_seed_fast(seed_midstate, params, nonce, 0, seed_a);
-            d_matmul_seed_fast(seed_midstate, params, nonce, 1, seed_b);
+            d_matmul_seeds_pair_fast(
+                seed_midstate, params, nonce, seed_a, seed_b);
             d_derive_sigma_fast(
                 header_midstate, params, nonce, seed_a, seed_b, sigma);
         } else {
@@ -1919,6 +1993,10 @@ __global__ void batch_perturb_pair_512x8_kernel(
 
     if (gid < matrix_elements) {
         const size_t batch_index = gid >> 18U;
+        if (g_batched_active_count != 0U &&
+            batch_index >= g_batched_active_count) {
+            return;
+        }
         const uint32_t local_index =
             static_cast<uint32_t>(gid & (kMatrixElements - 1U));
         const uint32_t row = local_index >> 9U;
@@ -1943,6 +2021,10 @@ __global__ void batch_perturb_pair_512x8_kernel(
 
     const size_t gid_b = gid - matrix_elements;
     const size_t batch_index = gid_b >> 18U;
+    if (g_batched_active_count != 0U &&
+        batch_index >= g_batched_active_count) {
+        return;
+    }
     const uint32_t local_index =
         static_cast<uint32_t>(gid_b & (kMatrixElements - 1U));
     const uint32_t row = local_index >> 9U;
@@ -1994,16 +2076,17 @@ __global__ void batch_compressed_words_kernel(
         const uint32_t row = bi * bsz + x;
         const uint32_t col = bj * bsz + y;
         const uint32_t weight = W[tid];
+        const size_t a_row_base = static_cast<size_t>(row) * n;
         for (uint32_t ell = 0; ell < blocks_per_axis; ++ell) {
             const uint32_t middle = ell * bsz;
+            const size_t a_base = a_row_base + middle;
             uint64_t dot = 0;
             uint32_t pending = 0;
             #pragma unroll
             for (uint32_t k = 0; k < 16; ++k) {
                 if (k < bsz) {
-                    dot += static_cast<uint64_t>(
-                        A[static_cast<size_t>(row) * n + middle + k]) *
-                        B[static_cast<size_t>(middle + k) * n + col];
+                    dot += static_cast<uint64_t>(A[a_base + k]) *
+                           B[(static_cast<size_t>(middle + k) * n + col)];
                     if (++pending == kReduceInterval) {
                         dot = d_reduce64(dot);
                         pending = 0;
@@ -2023,23 +2106,32 @@ __global__ void batch_compressed_words_kernel(
     }
 }
 
-__global__ void batch_compressed_words_512x16_kernel(
+__global__ __launch_bounds__(256, 2) void batch_compressed_words_512x16_kernel(
     const uint32_t* __restrict__ matrix_a,
     const uint32_t* __restrict__ matrix_b,
     const uint32_t* __restrict__ compress,
     uint32_t* __restrict__ output)
 {
     constexpr uint32_t kN = 512;
+    constexpr uint32_t kBsz = 16;
     constexpr uint32_t kWordsPerNonce = 32 * 32;
     constexpr size_t kMatrixElements = size_t{kN} * kN;
+    // Padded columns avoid 32-way shared-memory bank conflicts on [k][y] walks.
+    __shared__ uint32_t tile_a[kBsz][kBsz + 1U];
+    __shared__ uint32_t tile_b[kBsz][kBsz + 1U];
+
     const uint32_t global_word = blockIdx.x;
     const uint32_t batch_index = global_word >> 10U;
+    if (g_batched_active_count != 0U &&
+        batch_index >= g_batched_active_count) {
+        return;
+    }
     const uint32_t word_index = global_word & (kWordsPerNonce - 1U);
     const uint32_t bi = word_index >> 5U;
     const uint32_t bj = word_index & 31U;
     const uint32_t tid = threadIdx.x;
-    const uint32_t row = (bi << 4U) + (tid >> 4U);
-    const uint32_t col = (bj << 4U) + (tid & 15U);
+    const uint32_t x = tid >> 4U;
+    const uint32_t y = tid & 15U;
 
     const uint32_t* A =
         matrix_a + static_cast<size_t>(batch_index) * kMatrixElements;
@@ -2048,15 +2140,25 @@ __global__ void batch_compressed_words_512x16_kernel(
     const uint32_t weight =
         compress[(static_cast<size_t>(batch_index) << 8U) + tid];
 
+    const size_t a_block_row = static_cast<size_t>(bi) * kBsz;
+    const size_t b_block_col = static_cast<size_t>(bj) * kBsz;
+
     uint32_t thread_sum = 0;
     for (uint32_t ell = 0; ell < 32; ++ell) {
         const uint32_t middle = ell << 4U;
+        const size_t a_tile_base = (a_block_row * kN) + middle;
+        const size_t b_tile_base = (static_cast<size_t>(middle) * kN) + b_block_col;
+
+        const uint32_t ti = tid >> 4U;
+        const uint32_t tk = tid & 15U;
+        tile_a[ti][tk] = A[a_tile_base + (static_cast<size_t>(ti) * kN) + tk];
+        tile_b[tk][ti] = B[b_tile_base + (static_cast<size_t>(tk) * kN) + ti];
+        __syncthreads();
+
         uint64_t dot = 0;
         #pragma unroll
-        for (uint32_t k = 0; k < 16; ++k) {
-            dot += static_cast<uint64_t>(
-                A[static_cast<size_t>(row) * kN + middle + k]) *
-                B[static_cast<size_t>(middle + k) * kN + col];
+        for (uint32_t k = 0; k < kBsz; ++k) {
+            dot += static_cast<uint64_t>(tile_a[x][k]) * tile_b[k][y];
             if ((k & 3U) == 3U) {
                 dot = d_reduce64(dot);
             }
@@ -2064,6 +2166,7 @@ __global__ void batch_compressed_words_512x16_kernel(
         thread_sum = d_add(
             thread_sum,
             d_mul(static_cast<uint32_t>(d_reduce64(dot)), weight));
+        __syncthreads();
     }
 
     const uint32_t compressed_sum = d_block_reduce_add_u32(thread_sum);
@@ -2100,6 +2203,9 @@ struct PackedJobKey {
 
 struct DeviceLaunchPool {
     int device = -1;
+    uint32_t gate_graph_bucket = 0;
+    cudaGraph_t gate_graph = nullptr;
+    cudaGraphExec_t gate_graph_exec = nullptr;
     uint64_t* d_nonces = nullptr;
     uint32_t* d_workspace = nullptr;
     uint8_t* d_digests = nullptr;
@@ -2134,6 +2240,12 @@ DeviceLaunchPool g_launch_pool[16];
 
 struct BatchedMatMulPool {
     int device = -1;
+    uint32_t graph_bucket = 0;
+    uint32_t graph_n = 0;
+    uint32_t graph_bsz = 0;
+    uint32_t graph_r = 0;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
     uint8_t* d_noise_seeds = nullptr;
     uint8_t* d_compress_seeds = nullptr;
     uint32_t* d_seed_midstates = nullptr;
@@ -2162,8 +2274,22 @@ struct BatchedMatMulPool {
 
 BatchedMatMulPool g_batched_pool[16];
 
+void FreeBatchedGraph(BatchedMatMulPool& pool)
+{
+    if (pool.graph_exec) {
+        cudaGraphExecDestroy(pool.graph_exec);
+        pool.graph_exec = nullptr;
+    }
+    if (pool.graph) {
+        cudaGraphDestroy(pool.graph);
+        pool.graph = nullptr;
+    }
+    pool.graph_bucket = 0;
+}
+
 void FreeBatchedPool(BatchedMatMulPool& pool)
 {
+    FreeBatchedGraph(pool);
     if (pool.stream) {
         cudaStreamDestroy(pool.stream);
     }
@@ -2206,12 +2332,14 @@ bool EnsureBatchedPool(
         return false;
     }
     BatchedMatMulPool& pool = g_batched_pool[device];
-    if (pool.device == device && pool.capacity >= batch) {
+    const size_t needed = std::max(batch, pool.capacity);
+    const uint32_t bucket = BucketBatchSize(static_cast<uint32_t>(needed));
+    if (pool.device == device && pool.capacity >= bucket) {
         return true;
     }
     FreeBatchedPool(pool);
     pool.device = device;
-    pool.capacity = batch;
+    pool.capacity = bucket;
 
     const size_t matrix = batch * static_cast<size_t>(n) * n;
     const size_t noise_left = batch * static_cast<size_t>(n) * r;
@@ -2247,8 +2375,22 @@ bool EnsureBatchedPool(
     return ok;
 }
 
+void FreeGateGraph(DeviceLaunchPool& pool)
+{
+    if (pool.gate_graph_exec) {
+        cudaGraphExecDestroy(pool.gate_graph_exec);
+        pool.gate_graph_exec = nullptr;
+    }
+    if (pool.gate_graph) {
+        cudaGraphDestroy(pool.gate_graph);
+        pool.gate_graph = nullptr;
+    }
+    pool.gate_graph_bucket = 0;
+}
+
 void FreeLaunchPool(DeviceLaunchPool& pool)
 {
+    FreeGateGraph(pool);
     if (pool.gate_stream) {
         cudaStreamDestroy(pool.gate_stream);
     }
@@ -2445,6 +2587,134 @@ bool EnsureMatricesOnDevice(
     return true;
 }
 
+void LaunchBatchedPipelineKernels(
+    BatchedMatMulPool& pool,
+    uint32_t bucket_batch,
+    uint32_t n,
+    uint32_t r,
+    uint32_t bsz,
+    const uint8_t* d_seed_a,
+    const uint8_t* d_seed_b,
+    const uint8_t* d_sigma,
+    cudaStream_t stream)
+{
+    const uint32_t blocks_per_axis = n / bsz;
+    const uint32_t words_per_nonce = blocks_per_axis * blocks_per_axis;
+    const size_t matrix_elements = static_cast<size_t>(n) * n;
+    const size_t total_matrix_elements = static_cast<size_t>(bucket_batch) * matrix_elements;
+    const uint32_t noise_left_elements = n * r;
+    const uint32_t noise_right_elements = r * n;
+    const uint32_t compress_elements = bsz * bsz;
+
+    gpasha::PrecomputeSeedMidstatesPairKernel_launch(
+        d_seed_a, d_seed_b,
+        pool.d_seed_midstates,
+        pool.d_seed_midstates + static_cast<size_t>(bucket_batch) * 16,
+        bucket_batch, stream);
+    gpasha::GenerateMatricesPairKernel_launch(
+        d_seed_a, d_seed_b,
+        pool.d_seed_midstates,
+        pool.d_seed_midstates + static_cast<size_t>(bucket_batch) * 16,
+        bucket_batch, n, pool.d_base_a, pool.d_base_b, stream);
+    gpasha::DeriveNoiseSeedsKernel_launch(
+        d_sigma, pool.d_noise_seeds, pool.d_compress_seeds,
+        pool.d_noise_midstates, pool.d_compress_midstates, bucket_batch, stream);
+    gpasha::GenerateAllNoiseKernel_launch(
+        pool.d_noise_seeds, pool.d_noise_midstates, bucket_batch,
+        noise_left_elements, noise_right_elements,
+        pool.d_noise_el, pool.d_noise_er, pool.d_noise_fl, pool.d_noise_fr, stream);
+    gpasha::GenerateCompressKernel_launch(
+        pool.d_compress_seeds, pool.d_compress_midstates, bucket_batch,
+        compress_elements, pool.d_compress, stream);
+
+    constexpr uint32_t kThreads = 256;
+    const bool use_512x16x8 = n == 512 && bsz == 16 && r == 8;
+    if (use_512x16x8) {
+        const uint32_t pair_blocks = static_cast<uint32_t>(
+            ((total_matrix_elements * 2) + kThreads - 1) / kThreads);
+        batch_perturb_pair_512x8_kernel<<<pair_blocks, kThreads, 0, stream>>>(
+            pool.d_base_a, pool.d_base_b,
+            pool.d_noise_el, pool.d_noise_er,
+            pool.d_noise_fl, pool.d_noise_fr,
+            matrix_elements, pool.d_matrix_a, pool.d_matrix_b);
+        const uint32_t total_words = bucket_batch * words_per_nonce;
+        batch_compressed_words_512x16_kernel<<<total_words, kThreads, 0, stream>>>(
+            pool.d_matrix_a, pool.d_matrix_b, pool.d_compress,
+            pool.d_words);
+    } else {
+        const uint32_t matrix_blocks = static_cast<uint32_t>(
+            (total_matrix_elements + kThreads - 1) / kThreads);
+        batch_perturb_matrix_kernel<<<matrix_blocks, kThreads, 0, stream>>>(
+            pool.d_base_a, pool.d_noise_el, pool.d_noise_er, n, r,
+            matrix_elements, total_matrix_elements, pool.d_matrix_a);
+        batch_perturb_matrix_kernel<<<matrix_blocks, kThreads, 0, stream>>>(
+            pool.d_base_b, pool.d_noise_fl, pool.d_noise_fr, n, r,
+            matrix_elements, total_matrix_elements, pool.d_matrix_b);
+        const uint32_t total_words = bucket_batch * words_per_nonce;
+        batch_compressed_words_kernel<<<total_words, kThreads, 0, stream>>>(
+            pool.d_matrix_a, pool.d_matrix_b, pool.d_compress,
+            n, bsz, blocks_per_axis, words_per_nonce, matrix_elements,
+            pool.d_words);
+    }
+
+    gpasha::HashTranscriptCompareKernel_launch(
+        pool.d_words, d_sigma, words_per_nonce, n, bsz, bucket_batch,
+        pool.d_block_target, pool.d_share_target,
+        pool.d_digests, pool.d_results, stream);
+}
+
+bool EnsureBatchedGraph(
+    BatchedMatMulPool& pool,
+    uint32_t bucket_batch,
+    uint32_t n,
+    uint32_t r,
+    uint32_t bsz,
+    const uint8_t* d_seed_a,
+    const uint8_t* d_seed_b,
+    const uint8_t* d_sigma,
+    cudaStream_t stream,
+    bool& captured_now)
+{
+    captured_now = false;
+    if (pool.graph_exec != nullptr &&
+        pool.graph_bucket == bucket_batch &&
+        pool.graph_n == n &&
+        pool.graph_bsz == bsz &&
+        pool.graph_r == r) {
+        return true;
+    }
+    FreeBatchedGraph(pool);
+
+    uint32_t active = bucket_batch;
+    if (cudaMemcpyToSymbol(
+            g_batched_active_count, &active, sizeof(uint32_t),
+            0, cudaMemcpyHostToDevice) != cudaSuccess) {
+        return false;
+    }
+
+    if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal) != cudaSuccess) {
+        return false;
+    }
+    LaunchBatchedPipelineKernels(
+        pool, bucket_batch, n, r, bsz, d_seed_a, d_seed_b, d_sigma, stream);
+    if (cudaStreamEndCapture(stream, &pool.graph) != cudaSuccess ||
+        pool.graph == nullptr) {
+        FreeBatchedGraph(pool);
+        return false;
+    }
+    if (cudaGraphInstantiate(&pool.graph_exec, pool.graph, nullptr, nullptr, 0) !=
+        cudaSuccess) {
+        FreeBatchedGraph(pool);
+        return false;
+    }
+    pool.graph_bucket = bucket_batch;
+    pool.graph_n = n;
+    pool.graph_bsz = bsz;
+    pool.graph_r = r;
+    captured_now = true;
+    return true;
+}
+
 bool ProcessPassedNoncesBatched(
     int device,
     const btx::pow::MatMulJob& job,
@@ -2488,78 +2758,35 @@ bool ProcessPassedNoncesBatched(
         std::memcpy(pool.cached_block_target, block_target.data(), 32);
         std::memcpy(pool.cached_share_target, share_target.data(), 32);
         pool.targets_ready = true;
+        FreeBatchedGraph(pool);
     }
 
     const uint32_t n = job.n;
     const uint32_t r = job.r;
     const uint32_t bsz = job.b;
-    const uint32_t blocks_per_axis = n / bsz;
-    const uint32_t words_per_nonce = blocks_per_axis * blocks_per_axis;
-    const size_t matrix_elements = static_cast<size_t>(n) * n;
-    const size_t total_matrix_elements = batch * matrix_elements;
-    const uint32_t noise_left_elements = n * r;
-    const uint32_t noise_right_elements = r * n;
-    const uint32_t compress_elements = bsz * bsz;
-
     const uint32_t batch_u32 = static_cast<uint32_t>(batch);
+    const uint32_t bucket_batch = static_cast<uint32_t>(pool.capacity);
 
-    gpasha::PrecomputeSeedMidstatesKernel_launch(
-        d_seed_a, pool.d_seed_midstates, batch_u32, stream);
-    gpasha::PrecomputeSeedMidstatesKernel_launch(
-        d_seed_b, pool.d_seed_midstates + batch_u32 * 16, batch_u32, stream);
-    gpasha::GenerateMatrixKernel_launch(
-        d_seed_a, pool.d_seed_midstates, batch_u32, n, pool.d_base_a, stream);
-    gpasha::GenerateMatrixKernel_launch(
-        d_seed_b, pool.d_seed_midstates + batch_u32 * 16, batch_u32, n,
-        pool.d_base_b, stream);
-    gpasha::DeriveNoiseSeedsKernel_launch(
-        d_sigma, pool.d_noise_seeds, pool.d_compress_seeds,
-        pool.d_noise_midstates, pool.d_compress_midstates, batch_u32, stream);
-    gpasha::GenerateAllNoiseKernel_launch(
-        pool.d_noise_seeds, pool.d_noise_midstates, batch_u32,
-        noise_left_elements, noise_right_elements,
-        pool.d_noise_el, pool.d_noise_er, pool.d_noise_fl, pool.d_noise_fr, stream);
-    gpasha::GenerateCompressKernel_launch(
-        pool.d_compress_seeds, pool.d_compress_midstates, batch_u32,
-        compress_elements, pool.d_compress, stream);
-
-    constexpr uint32_t kThreads = 256;
-    const uint32_t matrix_blocks = static_cast<uint32_t>(
-        (total_matrix_elements + kThreads - 1) / kThreads);
-    const bool use_512x16x8 = n == 512 && bsz == 16 && r == 8;
-    if (use_512x16x8) {
-        const uint32_t pair_blocks = static_cast<uint32_t>(
-            ((total_matrix_elements * 2) + kThreads - 1) / kThreads);
-        batch_perturb_pair_512x8_kernel<<<pair_blocks, kThreads, 0, stream>>>(
-            pool.d_base_a, pool.d_base_b,
-            pool.d_noise_el, pool.d_noise_er,
-            pool.d_noise_fl, pool.d_noise_fr,
-            matrix_elements, pool.d_matrix_a, pool.d_matrix_b);
-    } else {
-        batch_perturb_matrix_kernel<<<matrix_blocks, kThreads, 0, stream>>>(
-            pool.d_base_a, pool.d_noise_el, pool.d_noise_er, n, r,
-            matrix_elements, total_matrix_elements, pool.d_matrix_a);
-        batch_perturb_matrix_kernel<<<matrix_blocks, kThreads, 0, stream>>>(
-            pool.d_base_b, pool.d_noise_fl, pool.d_noise_fr, n, r,
-            matrix_elements, total_matrix_elements, pool.d_matrix_b);
+    if (cudaMemcpyToSymbolAsync(
+            g_batched_active_count, &batch_u32, sizeof(uint32_t),
+            0, cudaMemcpyHostToDevice, stream) != cudaSuccess) {
+        return false;
     }
 
-    const uint32_t total_words = batch_u32 * words_per_nonce;
-    if (use_512x16x8) {
-        batch_compressed_words_512x16_kernel<<<total_words, kThreads, 0, stream>>>(
-            pool.d_matrix_a, pool.d_matrix_b, pool.d_compress,
-            pool.d_words);
+    bool captured_now = false;
+    if (EnsureBatchedGraph(
+            pool, bucket_batch, n, r, bsz,
+            d_seed_a, d_seed_b, d_sigma, stream, captured_now) &&
+        pool.graph_exec != nullptr) {
+        if (!captured_now &&
+            cudaGraphLaunch(pool.graph_exec, stream) != cudaSuccess) {
+            return false;
+        }
     } else {
-        batch_compressed_words_kernel<<<total_words, kThreads, 0, stream>>>(
-            pool.d_matrix_a, pool.d_matrix_b, pool.d_compress,
-            n, bsz, blocks_per_axis, words_per_nonce, matrix_elements,
-            pool.d_words);
+        LaunchBatchedPipelineKernels(
+            pool, bucket_batch, n, r, bsz,
+            d_seed_a, d_seed_b, d_sigma, stream);
     }
-
-    gpasha::HashTranscriptCompareKernel_launch(
-        pool.d_words, d_sigma, words_per_nonce, n, bsz, batch_u32,
-        pool.d_block_target, pool.d_share_target,
-        pool.d_digests, pool.d_results, stream);
 
     if (sync_at_end) {
         cudaError_t err = cudaStreamSynchronize(stream);
@@ -2630,6 +2857,71 @@ void FillPackedJobKey(
     }
 }
 
+void LaunchGateKernels(
+    DeviceLaunchPool& pool,
+    const CudaJobParams& h_params,
+    uint64_t start_nonce,
+    uint32_t bucket_batch,
+    cudaStream_t stream)
+{
+    constexpr int kGateThreads = 256;
+    const int gate_blocks =
+        static_cast<int>((bucket_batch + kGateThreads - 1) / kGateThreads);
+    sigma_gate_kernel<<<gate_blocks, kGateThreads, 0, stream>>>(
+        h_params, start_nonce, bucket_batch,
+        pool.d_seed_midstate, pool.d_header_midstate, pool.d_gate_count,
+        pool.d_passed_indices, pool.d_passed_sigma,
+        pool.d_passed_seed_a, pool.d_passed_seed_b);
+}
+
+bool EnsureGateGraph(
+    DeviceLaunchPool& pool,
+    const CudaJobParams& h_params,
+    uint32_t bucket_batch)
+{
+    if (pool.gate_graph_exec != nullptr &&
+        pool.gate_graph_bucket == bucket_batch) {
+        return true;
+    }
+    FreeGateGraph(pool);
+
+    if (cudaMemsetAsync(
+            pool.d_gate_count, 0, sizeof(uint32_t), pool.gate_stream) !=
+        cudaSuccess) {
+        return false;
+    }
+
+    uint32_t active = bucket_batch;
+    uint64_t nonce_start = 0;
+    if (cudaMemcpyToSymbol(
+            g_gate_nonce_count, &active, sizeof(uint32_t),
+            0, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpyToSymbol(
+            g_gate_nonce_start, &nonce_start, sizeof(uint64_t),
+            0, cudaMemcpyHostToDevice) != cudaSuccess) {
+        return false;
+    }
+
+    if (cudaStreamBeginCapture(pool.gate_stream, cudaStreamCaptureModeGlobal) !=
+        cudaSuccess) {
+        return false;
+    }
+    LaunchGateKernels(pool, h_params, 0ULL, bucket_batch, pool.gate_stream);
+    if (cudaStreamEndCapture(pool.gate_stream, &pool.gate_graph) != cudaSuccess ||
+        pool.gate_graph == nullptr) {
+        FreeGateGraph(pool);
+        return false;
+    }
+    if (cudaGraphInstantiate(
+            &pool.gate_graph_exec, pool.gate_graph, nullptr, nullptr, 0) !=
+        cudaSuccess) {
+        FreeGateGraph(pool);
+        return false;
+    }
+    pool.gate_graph_bucket = bucket_batch;
+    return true;
+}
+
 bool LaunchGateForBatch(
     DeviceLaunchPool& pool,
     const CudaJobParams& h_params,
@@ -2638,31 +2930,58 @@ bool LaunchGateForBatch(
     uint64_t start_nonce,
     size_t batch)
 {
-    if (cudaMemsetAsync(pool.d_gate_count, 0, sizeof(uint32_t), pool.gate_stream) !=
-        cudaSuccess) {
-        return false;
-    }
-
     PackedJobKey job_key{};
     FillPackedJobKey(job, share_target, job_key);
     const bool job_changed =
         !pool.job_midstate_ready ||
         std::memcmp(&pool.job_key, &job_key, sizeof(job_key)) != 0;
     if (job_changed) {
+        FreeGateGraph(pool);
+        if (cudaMemsetAsync(
+                pool.d_gate_count, 0, sizeof(uint32_t), pool.gate_stream) !=
+            cudaSuccess) {
+            return false;
+        }
         init_scan_midstates_kernel<<<1, 1, 0, pool.gate_stream>>>(
             h_params, pool.d_seed_midstate, pool.d_header_midstate);
         pool.job_key = job_key;
         pool.job_midstate_ready = true;
     }
 
-    constexpr int kGateThreads = 256;
-    const int gate_blocks =
-        static_cast<int>((batch + kGateThreads - 1) / kGateThreads);
-    sigma_gate_kernel<<<gate_blocks, kGateThreads, 0, pool.gate_stream>>>(
-        h_params, start_nonce, batch,
-        pool.d_seed_midstate, pool.d_header_midstate, pool.d_gate_count,
-        pool.d_passed_indices, pool.d_passed_sigma,
-        pool.d_passed_seed_a, pool.d_passed_seed_b);
+    const uint32_t batch_u32 = static_cast<uint32_t>(batch);
+    const uint32_t bucket_batch = BucketBatchSize(batch_u32);
+
+    if (cudaMemcpyToSymbolAsync(
+            g_gate_nonce_count, &batch_u32, sizeof(uint32_t),
+            0, cudaMemcpyHostToDevice, pool.gate_stream) != cudaSuccess ||
+        cudaMemcpyToSymbolAsync(
+            g_gate_nonce_start, &start_nonce, sizeof(uint64_t),
+            0, cudaMemcpyHostToDevice, pool.gate_stream) != cudaSuccess) {
+        return false;
+    }
+
+    if (!job_changed &&
+        EnsureGateGraph(pool, h_params, bucket_batch) &&
+        pool.gate_graph_exec != nullptr) {
+        if (cudaMemsetAsync(
+                pool.d_gate_count, 0, sizeof(uint32_t), pool.gate_stream) !=
+            cudaSuccess) {
+            return false;
+        }
+        if (cudaGraphLaunch(pool.gate_graph_exec, pool.gate_stream) !=
+            cudaSuccess) {
+            return false;
+        }
+    } else {
+        if (!job_changed &&
+            cudaMemsetAsync(
+                pool.d_gate_count, 0, sizeof(uint32_t), pool.gate_stream) !=
+            cudaSuccess) {
+            return false;
+        }
+        LaunchGateKernels(
+            pool, h_params, start_nonce, bucket_batch, pool.gate_stream);
+    }
 
     if (cudaMemcpyAsync(
             &pool.h_gate_count, pool.d_gate_count, sizeof(uint32_t),

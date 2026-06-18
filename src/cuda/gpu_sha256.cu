@@ -7,6 +7,14 @@
 
 namespace gpasha {
 
+extern __constant__ uint32_t g_batched_active_count;
+
+__device__ __forceinline__ uint32_t d_active_batch(uint32_t batch_size)
+{
+    const uint32_t active = g_batched_active_count;
+    return active != 0U ? active : batch_size;
+}
+
 __device__ __forceinline__ uint32_t d_rotr(uint32_t x, uint32_t n)
 {
     return (x >> n) | (x << (32 - n));
@@ -468,9 +476,10 @@ __global__ void DeriveNoiseSeedsKernel(
     uint32_t batch_size)
 {
     const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t active_batch = d_active_batch(batch_size);
     const uint32_t nonce_idx = idx / 5;
     const uint32_t seed_idx = idx % 5;
-    if (nonce_idx >= batch_size) {
+    if (nonce_idx >= active_batch) {
         return;
     }
     const uint8_t* sigma = sigma_batch + size_t(nonce_idx) * 32;
@@ -502,10 +511,33 @@ __global__ void PrecomputeSeedMidstatesKernel(
     uint32_t seed_count)
 {
     const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= seed_count) {
+    if (idx >= d_active_batch(seed_count)) {
         return;
     }
     d_compute_seed_midstate(seeds + size_t(idx) * 32, seed_midstates + size_t(idx) * 16);
+}
+
+__global__ void PrecomputeSeedMidstatesPairKernel(
+    const uint8_t* seeds_a,
+    const uint8_t* seeds_b,
+    uint32_t* midstates_a,
+    uint32_t* midstates_b,
+    uint32_t batch_size)
+{
+    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t active_batch = d_active_batch(batch_size);
+    if (idx < batch_size) {
+        if (idx < active_batch) {
+            d_compute_seed_midstate(
+                seeds_a + size_t(idx) * 32, midstates_a + size_t(idx) * 16);
+        }
+    } else if (idx < batch_size * 2U) {
+        const uint32_t j = idx - batch_size;
+        if (j < active_batch) {
+            d_compute_seed_midstate(
+                seeds_b + size_t(j) * 32, midstates_b + size_t(j) * 16);
+        }
+    }
 }
 
 __global__ void GenerateNoiseKernel(
@@ -519,7 +551,7 @@ __global__ void GenerateNoiseKernel(
     const size_t gid = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const uint32_t nonce_idx = static_cast<uint32_t>(gid / num_elements);
     const uint32_t elem_idx = static_cast<uint32_t>(gid % num_elements);
-    if (nonce_idx >= batch_size) {
+    if (nonce_idx >= d_active_batch(batch_size)) {
         return;
     }
     const size_t seed_slot = size_t(nonce_idx) * 4 + seed_index;
@@ -540,7 +572,7 @@ __global__ void GenerateCompressKernel(
     const size_t gid = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const uint32_t nonce_idx = static_cast<uint32_t>(gid / num_elements);
     const uint32_t elem_idx = static_cast<uint32_t>(gid % num_elements);
-    if (nonce_idx >= batch_size) {
+    if (nonce_idx >= d_active_batch(batch_size)) {
         return;
     }
     const uint8_t* seed = compress_seeds + size_t(nonce_idx) * 32;
@@ -706,8 +738,9 @@ __global__ void HashTranscriptKernel(
     uint32_t batch_size,
     uint8_t* digest_batch)
 {
-    const uint32_t nonce_idx = blockIdx.x;
-    if (nonce_idx >= batch_size) {
+    const uint32_t nonce_idx =
+        blockIdx.x * blockDim.x + threadIdx.x;
+    if (nonce_idx >= d_active_batch(batch_size)) {
         return;
     }
     const Element* words = compressed_words + size_t(nonce_idx) * words_per_nonce;
@@ -732,8 +765,9 @@ __global__ void HashTranscriptCompareKernel(
     uint8_t* digest_batch,
     int32_t* results)
 {
-    const uint32_t nonce_idx = blockIdx.x;
-    if (nonce_idx >= batch_size) {
+    const uint32_t nonce_idx =
+        blockIdx.x * blockDim.x + threadIdx.x;
+    if (nonce_idx >= d_active_batch(batch_size)) {
         return;
     }
     const Element* words = compressed_words + size_t(nonce_idx) * words_per_nonce;
@@ -793,7 +827,7 @@ __global__ void GenerateAllNoiseKernel(
 
     const uint32_t nonce_idx = static_cast<uint32_t>(local / num_elements);
     const uint32_t elem_idx = static_cast<uint32_t>(local % num_elements);
-    if (nonce_idx >= batch_size) {
+    if (nonce_idx >= d_active_batch(batch_size)) {
         return;
     }
 
@@ -906,7 +940,8 @@ __global__ void GenerateMatrixKernel(
     Element* output)
 {
     const size_t gid = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    const uint32_t total_elements = batch_size * n * n;
+    const uint32_t active_batch = d_active_batch(batch_size);
+    const uint32_t total_elements = active_batch * n * n;
     if (gid >= size_t(total_elements)) {
         return;
     }
@@ -917,6 +952,43 @@ __global__ void GenerateMatrixKernel(
         ? d_from_oracle_midstate(seed_midstates + size_t(nonce_idx) * 16, seed, elem_idx)
         : d_from_oracle_fast(seed, elem_idx);
     output[size_t(nonce_idx) * n * n + elem_idx] = val;
+}
+
+__global__ void GenerateMatricesPairKernel(
+    const uint8_t* seeds_a,
+    const uint8_t* seeds_b,
+    const uint32_t* midstates_a,
+    const uint32_t* midstates_b,
+    uint32_t batch_size,
+    uint32_t n,
+    Element* output_a,
+    Element* output_b)
+{
+    const size_t gid = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint32_t active_batch = d_active_batch(batch_size);
+    const size_t plane = size_t(active_batch) * n * n;
+    const size_t total = plane * 2U;
+    if (gid >= total) {
+        return;
+    }
+    if (gid < plane) {
+        const uint32_t nonce_idx = static_cast<uint32_t>(gid / (n * n));
+        const uint32_t elem_idx = static_cast<uint32_t>(gid % (n * n));
+        const uint8_t* seed = seeds_a + size_t(nonce_idx) * 32;
+        output_a[gid] = midstates_a
+            ? d_from_oracle_midstate(
+                  midstates_a + size_t(nonce_idx) * 16, seed, elem_idx)
+            : d_from_oracle_fast(seed, elem_idx);
+        return;
+    }
+    const size_t gid_b = gid - plane;
+    const uint32_t nonce_idx = static_cast<uint32_t>(gid_b / (n * n));
+    const uint32_t elem_idx = static_cast<uint32_t>(gid_b % (n * n));
+    const uint8_t* seed = seeds_b + size_t(nonce_idx) * 32;
+    output_b[gid_b] = midstates_b
+        ? d_from_oracle_midstate(
+              midstates_b + size_t(nonce_idx) * 16, seed, elem_idx)
+        : d_from_oracle_fast(seed, elem_idx);
 }
 
 void DeriveNoiseSeedsKernel_launch(
@@ -973,6 +1045,22 @@ void PrecomputeSeedMidstatesKernel_launch(
         seeds, seed_midstates, seed_count);
 }
 
+void PrecomputeSeedMidstatesPairKernel_launch(
+    const uint8_t* seeds_a,
+    const uint8_t* seeds_b,
+    uint32_t* midstates_a,
+    uint32_t* midstates_b,
+    uint32_t batch_size,
+    cudaStream_t stream)
+{
+    EnsureKInitialized();
+    const uint32_t threads = 256;
+    const uint32_t total = batch_size * 2U;
+    const uint32_t blocks = (total + threads - 1) / threads;
+    PrecomputeSeedMidstatesPairKernel<<<blocks, threads, 0, stream>>>(
+        seeds_a, seeds_b, midstates_a, midstates_b, batch_size);
+}
+
 void GenerateNoiseKernel_launch(
     const uint8_t* noise_seeds,
     const uint32_t* seed_midstates,
@@ -1017,7 +1105,9 @@ void HashTranscriptCompareKernel_launch(
     int32_t* results,
     cudaStream_t stream)
 {
-    HashTranscriptCompareKernel<<<batch_size, 1, 0, stream>>>(
+    constexpr uint32_t kThreads = 256;
+    const uint32_t blocks = (batch_size + kThreads - 1) / kThreads;
+    HashTranscriptCompareKernel<<<blocks, kThreads, 0, stream>>>(
         compressed_words, sigma_batch, words_per_nonce, n, b, batch_size,
         block_target, share_target, digest_batch, results);
 }
@@ -1032,7 +1122,9 @@ void HashTranscriptKernel_launch(
     uint8_t* digest_batch,
     cudaStream_t stream)
 {
-    HashTranscriptKernel<<<batch_size, 1, 0, stream>>>(
+    constexpr uint32_t kThreads = 256;
+    const uint32_t blocks = (batch_size + kThreads - 1) / kThreads;
+    HashTranscriptKernel<<<blocks, kThreads, 0, stream>>>(
         compressed_words, sigma_batch, words_per_nonce, n, b, batch_size, digest_batch);
 }
 
@@ -1063,6 +1155,26 @@ void GenerateMatrixKernel_launch(
     const uint32_t blocks = (total_elements + threads - 1) / threads;
     GenerateMatrixKernel<<<blocks, threads, 0, stream>>>(
         seeds, seed_midstates, batch_size, n, output);
+}
+
+void GenerateMatricesPairKernel_launch(
+    const uint8_t* seeds_a,
+    const uint8_t* seeds_b,
+    const uint32_t* midstates_a,
+    const uint32_t* midstates_b,
+    uint32_t batch_size,
+    uint32_t n,
+    Element* output_a,
+    Element* output_b,
+    cudaStream_t stream)
+{
+    EnsureKInitialized();
+    const uint32_t total_elements = batch_size * n * n * 2U;
+    const uint32_t threads = 256;
+    const uint32_t blocks = (total_elements + threads - 1) / threads;
+    GenerateMatricesPairKernel<<<blocks, threads, 0, stream>>>(
+        seeds_a, seeds_b, midstates_a, midstates_b,
+        batch_size, n, output_a, output_b);
 }
 
 } // namespace gpasha

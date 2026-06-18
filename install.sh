@@ -196,6 +196,23 @@ ensure_install_dirs() {
     chmod 0755 "$INSTALL_PREFIX" "$BIN_DIR" "$STATE_DIR" 2>/dev/null || true
 }
 
+install_binary() {
+    local src="$1"
+    local dest="$2"
+    if command -v install >/dev/null 2>&1; then
+        install -m 0755 "$src" "$dest"
+    else
+        cp -f "$src" "$dest"
+        chmod 0755 "$dest"
+    fi
+}
+
+resolve_latest_release() {
+    curl -fsSL "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest" \
+        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\(v[^"]*\)".*/\1/p' \
+        | head -1
+}
+
 ensure_path_entry() {
     local line="export PATH=\"${BIN_DIR}:\$PATH\""
     local marker="# added by btx-nvidia-miner install.sh"
@@ -231,12 +248,20 @@ install_prebuilt() {
     echo "  ${RELEASE_URL}"
     local tmp_dir
     tmp_dir="$(mktemp -d)"
-    trap 'rm -rf "$tmp_dir"' EXIT
+    # Quote-expand now: local tmp_dir is out of scope when EXIT runs under set -u.
+    trap "rm -rf '${tmp_dir}'" EXIT
 
     if ! curl -fsSL -o "${tmp_dir}/${RELEASE_ASSET}" "${RELEASE_URL}"; then
+        local latest_tag
+        latest_tag="$(resolve_latest_release || true)"
         echo "ERROR: failed to download release asset."
         echo "Check that ${RELEASE_TAG} exists at:"
         echo "  https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/tag/${RELEASE_TAG}"
+        if [[ -n "$latest_tag" && "$latest_tag" != "$RELEASE_TAG" ]]; then
+            echo "Latest published release: ${latest_tag}"
+            echo "Re-run with: --version ${latest_tag#v}"
+        fi
+        echo "Or build locally: add --build-from-source (requires nvcc)."
         exit 1
     fi
 
@@ -246,7 +271,7 @@ install_prebuilt() {
         exit 1
     fi
 
-    install -m 0755 "${tmp_dir}/${BINARY_NAME}" "${BIN_DIR}/${BINARY_NAME}"
+    install_binary "${tmp_dir}/${BINARY_NAME}" "${BIN_DIR}/${BINARY_NAME}"
     echo "Installed prebuilt binary to ${BIN_DIR}/${BINARY_NAME}"
 }
 
@@ -290,21 +315,21 @@ EOM
     echo "CUDA Toolkit found: $(nvcc --version | tail -1)"
 
     local src_dir="${HOME}/btx-nvidia-miner-src"
-    local git_branch="${GIT_BRANCH:-main}"
+    # Default to the requested release tag; override with GIT_BRANCH=main for bleeding edge.
+    local git_ref="${GIT_BRANCH:-${RELEASE_TAG}}"
 
     if [[ -d "$src_dir/.git" ]]; then
-        echo "Updating existing source in $src_dir (branch: $git_branch)"
+        echo "Updating existing source in $src_dir (ref: $git_ref)"
         (
             cd "$src_dir"
             git remote set-url origin "$REPO_URL"
-            git fetch --depth 1 origin "$git_branch"
-            git checkout -B "$git_branch" "origin/$git_branch"
-            git reset --hard "origin/$git_branch"
+            git fetch --depth 1 origin "$git_ref"
+            git checkout -f FETCH_HEAD
         )
     else
-        echo "Cloning into $src_dir (branch: $git_branch)"
+        echo "Cloning into $src_dir (ref: $git_ref)"
         rm -rf "$src_dir"
-        git clone --depth 1 --branch "$git_branch" "$REPO_URL" "$src_dir"
+        git clone --depth 1 --branch "$git_ref" "$REPO_URL" "$src_dir"
     fi
 
     cd "$src_dir"
@@ -338,7 +363,7 @@ EOM
           -DCMAKE_CUDA_ARCHITECTURES="${cuda_arch_list}" \
           ..
     cmake --build . -j"$(nproc)" --target btx-miner
-    install -m 0755 btx-miner "${BIN_DIR}/${BINARY_NAME}"
+    install_binary btx-miner "${BIN_DIR}/${BINARY_NAME}"
     echo "Built from commit: $build_commit"
 }
 

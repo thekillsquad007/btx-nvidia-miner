@@ -275,6 +275,13 @@ if(BTX_MINER_BUILD_TESTS)
             CUDA_RESOLVE_DEVICE_SYMBOLS OFF
         )
         add_test(NAME cuda_pow_reference COMMAND btx-miner-cuda-test)
+
+        add_executable(btx-wmma-experiment tests/wmma_m31_experiment.cu)
+        target_link_libraries(btx-wmma-experiment PRIVATE CUDA::cudart)
+        set_target_properties(btx-wmma-experiment PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF
+            CUDA_RESOLVE_DEVICE_SYMBOLS OFF
+        )
     endif()
 endif()
 

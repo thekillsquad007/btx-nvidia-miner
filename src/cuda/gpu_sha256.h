@@ -26,6 +26,14 @@ void PrecomputeSeedMidstatesKernel_launch(
     uint32_t seed_count,
     cudaStream_t stream = 0);
 
+void PrecomputeSeedMidstatesPairKernel_launch(
+    const uint8_t* seeds_a,
+    const uint8_t* seeds_b,
+    uint32_t* midstates_a,
+    uint32_t* midstates_b,
+    uint32_t batch_size,
+    cudaStream_t stream = 0);
+
 void GenerateAllNoiseKernel_launch(
     const uint8_t* noise_seeds,
     const uint32_t* seed_midstates,
@@ -92,6 +100,17 @@ void GenerateMatrixKernel_launch(
     uint32_t batch_size,
     uint32_t n,
     Element* output,
+    cudaStream_t stream = 0);
+
+void GenerateMatricesPairKernel_launch(
+    const uint8_t* seeds_a,
+    const uint8_t* seeds_b,
+    const uint32_t* midstates_a,
+    const uint32_t* midstates_b,
+    uint32_t batch_size,
+    uint32_t n,
+    Element* output_a,
+    Element* output_b,
     cudaStream_t stream = 0);
 
 } // namespace gpasha

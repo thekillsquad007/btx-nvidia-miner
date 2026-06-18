@@ -45,6 +45,7 @@ Common:
   --verbose                 Extra stratum debug logging
   --benchmark               Run CPU smoke test + GPU throughput benchmark
   --benchmark-seconds <n>   GPU benchmark duration (default: 20)
+  --benchmark-epsilon <n>   Pre-hash gate epsilon_bits for GPU benchmark (default: 18)
   --no-gpu                  Force CPU reference path only
   --dev-fee <pct>           Dev fee percent 0-5 (default: 1, or BTX_DEV_FEE_PCT)
   -h, --help                This help
@@ -149,6 +150,7 @@ int main(int argc, char** argv)
     std::string pass = "x";
     bool do_bench = false;
     int bench_seconds = 20;
+    int bench_epsilon_bits = 18;
     bool force_cpu = false;
     bool verbose = false;
     bool print_gpu_batch = false;
@@ -168,6 +170,7 @@ int main(int argc, char** argv)
         if (a == "--version") { std::cout << "btx-miner v" << btx::common::kMinerVersion << std::endl; return 0; }
         if (a == "--benchmark") do_bench = true;
         if (a == "--benchmark-seconds" && i+1 < argc) bench_seconds = std::atoi(argv[++i]);
+        if (a == "--benchmark-epsilon" && i+1 < argc) bench_epsilon_bits = std::atoi(argv[++i]);
         if (a == "--no-gpu") force_cpu = true;
         if (a == "--verbose") verbose = true;
         if (a == "--solo") mode = "solo";
@@ -294,7 +297,7 @@ int main(int argc, char** argv)
             bench_job.time = 1775000000u;
             bench_job.bits = 0x1d0b8746;
             bench_job.block_height = btx::pow::kMatMulSeedV2Height;
-            bench_job.epsilon_bits = 18;
+            bench_job.epsilon_bits = static_cast<uint32_t>(bench_epsilon_bits);
             bench_job.target.assign(32, 0xff);
             std::memset(bench_job.prev_hash.data(), 0x01, 32);
             std::memset(bench_job.merkle_root.data(), 0x02, 32);
@@ -310,8 +313,8 @@ int main(int argc, char** argv)
             const uint64_t chunk = static_cast<uint64_t>(
                 std::max(131072, btx::cuda::RecommendJobChunkSize(batch_config, bench_job)));
 
-            std::cout << "GPU benchmark (" << bench_seconds << "s, chunk="
-                      << chunk << ")..." << std::endl;
+            std::cout << "GPU benchmark (" << bench_seconds << "s, epsilon_bits="
+                      << bench_epsilon_bits << ", chunk=" << chunk << ")..." << std::endl;
             while (std::chrono::steady_clock::now() < deadline) {
                 (void)btx::cuda::SolveBatchCuda(bench_job, nonce, chunk, batch_config);
                 total_nonces += chunk;
