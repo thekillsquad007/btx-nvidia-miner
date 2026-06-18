@@ -1363,9 +1363,13 @@ __device__ bool d_solve_nonce(
     __shared__ uint32_t s_mat_a_midstate[16];
     __shared__ uint32_t s_mat_b_midstate[16];
     __shared__ uint32_t s_noise_midstate[16];
+    __shared__ uint32_t s_tx_state[8];
+    __shared__ uint32_t s_tx_buf[16];
+    __shared__ uint32_t s_tx_count;
 
     const bool use_v2 = job.block_height >= 125000;
-    const bool use_factored = d_use_factored_path(job.n, job.b);
+    const bool use_v3 = job.block_height >= btx::pow::kMatMulSeedV3Height;
+    const bool use_factored = use_v2 ? false : d_use_factored_path(job.n, job.b);
 
     if (threadIdx.x == 0 && use_v2) {
         d_init_scan_midstates(job, s_scan_seed_midstate, s_scan_header_midstate);
@@ -1476,7 +1480,12 @@ __device__ bool d_solve_nonce(
     } else {
         const uint32_t total_steps = N * N * N;
 
-        // Product-committed digest: sum compress(A'[i,ell]*B'[ell,j]) over ell per (i,j).
+        if (threadIdx.x == 0 && use_v2 && !use_v3) {
+            d_sha256_init_words(s_tx_state);
+            s_tx_count = 0;
+        }
+        __syncthreads();
+
         for (uint32_t step = 0; step < total_steps; ++step) {
             const uint32_t bi = step / (N * N);
             const uint32_t rem = step % (N * N);
@@ -1507,16 +1516,70 @@ __device__ bool d_solve_nonce(
                 const uint32_t word_idx = bi * N + bj;
                 const uint32_t term = d_dot(prod, compress_v, bsz * bsz);
                 C[word_idx] = d_add(C[word_idx], term);
+
+                if (use_v2 && !use_v3) {
+                    s_tx_buf[s_tx_count++] = d_bswap32(C[word_idx]);
+                    if (s_tx_count == 16) {
+                        d_sha256_compress(s_tx_state, s_tx_buf);
+                        s_tx_count = 0;
+                    }
+                }
             }
             __syncthreads();
         }
     }
 
     if (threadIdx.x == 0) {
-        uint8_t c_prime[32];
-        d_hash_matrix_words(C, word_count, c_prime);
-        d_finalize_product_digest(s_sigma, c_prime, job.n, bsz, digest_out);
-        s_hit = d_uint256_le(digest_out, job.target);
+        if (use_v2 && !use_v3) {
+            uint64_t bit_len = static_cast<uint64_t>(word_count * N) * 32;
+            if (s_tx_count == 0) {
+                uint32_t pad[16] = {};
+                pad[0] = 0x80000000U;
+                pad[14] = static_cast<uint32_t>(bit_len >> 32);
+                pad[15] = static_cast<uint32_t>(bit_len);
+                d_sha256_compress(s_tx_state, pad);
+            } else {
+                s_tx_buf[s_tx_count] = 0x80000000U;
+                for (uint32_t i = s_tx_count + 1; i < 15; ++i) {
+                    s_tx_buf[i] = 0;
+                }
+                if (s_tx_count < 14) {
+                    s_tx_buf[14] = static_cast<uint32_t>(bit_len >> 32);
+                    s_tx_buf[15] = static_cast<uint32_t>(bit_len);
+                    d_sha256_compress(s_tx_state, s_tx_buf);
+                } else {
+                    d_sha256_compress(s_tx_state, s_tx_buf);
+                    uint32_t pad2[16] = {};
+                    pad2[14] = static_cast<uint32_t>(bit_len >> 32);
+                    pad2[15] = static_cast<uint32_t>(bit_len);
+                    d_sha256_compress(s_tx_state, pad2);
+                }
+            }
+
+            uint32_t inner[8];
+            for (int i = 0; i < 8; ++i) inner[i] = s_tx_state[i];
+            d_sha256_init_words(s_tx_state);
+            uint32_t w2[16] = {};
+            w2[0] = inner[0]; w2[1] = inner[1]; w2[2] = inner[2]; w2[3] = inner[3];
+            w2[4] = inner[4]; w2[5] = inner[5]; w2[6] = inner[6]; w2[7] = inner[7];
+            w2[8] = 0x80000000U;
+            w2[15] = 0x00000100U;
+            d_sha256_compress(s_tx_state, w2);
+
+            for (int i = 0; i < 8; ++i) {
+                digest_out[i*4]   = static_cast<uint8_t>((s_tx_state[i] >> 24U) & 0xffU);
+                digest_out[i*4+1] = static_cast<uint8_t>((s_tx_state[i] >> 16U) & 0xffU);
+                digest_out[i*4+2] = static_cast<uint8_t>((s_tx_state[i] >> 8U) & 0xffU);
+                digest_out[i*4+3] = static_cast<uint8_t>(s_tx_state[i] & 0xffU);
+            }
+
+            s_hit = d_uint256_le(digest_out, job.target);
+        } else {
+            uint8_t c_prime[32];
+            d_hash_matrix_words(C, word_count, c_prime);
+            d_finalize_product_digest(s_sigma, c_prime, job.n, bsz, digest_out);
+            s_hit = d_uint256_le(digest_out, job.target);
+        }
     }
     __syncthreads();
     return s_hit;
@@ -1544,7 +1607,7 @@ __global__ void matmul_nonce_kernel(
     const size_t scratch_elems = static_cast<size_t>(bsz) * bsz;
     const size_t compress_elems = scratch_elems;
     const bool use_v2 = params.block_height >= 125000;
-    const bool use_factored = d_use_factored_path(n, bsz);
+    const bool use_factored = use_v2 ? false : d_use_factored_path(n, bsz);
     const size_t blocks_per_axis = static_cast<size_t>(n / bsz);
     const size_t matrix_elems = use_v2 ? (2 * nn) : (use_factored ? (2 * nn) : 0);
     const size_t factored_rhs_elems = use_factored ? (static_cast<size_t>(bsz) * n * blocks_per_axis) : 0;
@@ -1970,6 +2033,7 @@ struct DeviceLaunchPool {
     size_t ws_bytes = 0;
     size_t digest_cap = 0;
     uint32_t last_gate_passed = 0;
+    bool use_batched_matmul = false;
     PackedJobKey job_key{};
     bool job_midstate_ready = false;
 };
@@ -2542,30 +2606,55 @@ bool CollectScatteredHits(
     if (device < 0 || device >= 16) {
         return false;
     }
-    BatchedMatMulPool& bpool = g_batched_pool[device];
 
     std::vector<uint32_t> indices(passed);
-    std::vector<int32_t> results(passed);
-    std::vector<uint8_t> digests(static_cast<size_t>(passed) * 32);
-
     if (cudaMemcpy(
             indices.data(), pool.d_passed_indices, passed * sizeof(uint32_t),
             cudaMemcpyDeviceToHost) != cudaSuccess) {
         return false;
     }
+
+    if (pool.use_batched_matmul) {
+        BatchedMatMulPool& bp = g_batched_pool[device];
+        std::vector<int32_t> results(passed);
+        if (cudaMemcpy(
+                results.data(), bp.d_results, passed * sizeof(int32_t),
+                cudaMemcpyDeviceToHost) != cudaSuccess) {
+            return false;
+        }
+        for (uint32_t i = 0; i < passed; ++i) {
+            if (results[i] == 0) {
+                continue;
+            }
+            const uint32_t idx = indices[i];
+            if (idx >= launch_batch) {
+                continue;
+            }
+            out_found[idx] = true;
+            if (cudaMemcpy(
+                    out_digests[idx].data(), bp.d_digests + static_cast<size_t>(i) * 32, 32,
+                    cudaMemcpyDeviceToHost) != cudaSuccess) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    std::vector<uint8_t> found(passed);
+    std::vector<uint8_t> digests(static_cast<size_t>(passed) * 32);
     if (cudaMemcpy(
-            results.data(), bpool.d_results, passed * sizeof(int32_t),
+            found.data(), pool.d_found, passed,
             cudaMemcpyDeviceToHost) != cudaSuccess) {
         return false;
     }
     if (cudaMemcpy(
-            digests.data(), bpool.d_digests, static_cast<size_t>(passed) * 32,
+            digests.data(), pool.d_digests, static_cast<size_t>(passed) * 32,
             cudaMemcpyDeviceToHost) != cudaSuccess) {
         return false;
     }
 
     for (uint32_t i = 0; i < passed; ++i) {
-        if (results[i] == 0) {
+        if (!found[i]) {
             continue;
         }
         const uint32_t idx = indices[i];
@@ -2613,7 +2702,7 @@ size_t WorkspaceUint32Count(uint32_t n, uint32_t r, uint32_t bsz, bool use_v2_se
     const size_t nn = static_cast<size_t>(n) * n;
     const size_t noise_elems = 2 * (static_cast<size_t>(n) * r + static_cast<size_t>(r) * n);
     const size_t scratch = static_cast<size_t>(bsz) * bsz;
-    const bool use_factored = d_use_factored_path(n, bsz);
+    const bool use_factored = use_v2_seeds ? false : d_use_factored_path(n, bsz);
     const size_t blocks_per_axis = static_cast<size_t>(n / bsz);
     const size_t matrix_elems = use_v2_seeds ? (2 * nn) : (use_factored ? (2 * nn) : 0);
     const size_t factored_rhs_elems =
@@ -2774,9 +2863,9 @@ extern "C" bool LaunchMatMulTranscriptBatch(
     pool.last_gate_passed = passed;
 
     if (passed > 0) {
-        if (!EnsureBatchedPool(device, passed, job.n, job.r, job.b)) {
-            return false;
-        }
+        // Batched transcript path: reuse gate seeds/sigma on device, parallelize
+        // matrix perturbation + blocked compression across all passed nonces.
+        pool.use_batched_matmul = true;
         if (!ProcessPassedNoncesBatched(
                 device, job, share_target, passed,
                 pool.d_passed_seed_a, pool.d_passed_seed_b, pool.d_passed_sigma,
@@ -2788,6 +2877,7 @@ extern "C" bool LaunchMatMulTranscriptBatch(
         }
         pool.matmul_in_flight = true;
     } else {
+        pool.use_batched_matmul = false;
         pool.matmul_in_flight = false;
     }
 
