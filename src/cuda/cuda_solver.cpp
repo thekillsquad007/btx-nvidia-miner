@@ -30,7 +30,7 @@ size_t WorkspaceBytesPerNonce(const pow::MatMulJob& job)
     const size_t noise_elems = 2 * (static_cast<size_t>(n) * r + static_cast<size_t>(r) * n);
     const size_t scratch = static_cast<size_t>(bsz) * bsz;
     const bool use_v2 = job.block_height >= pow::kMatMulSeedV2Height;
-    const bool use_factored = (n % 32U) == 0U && ((n / bsz) % 2U) == 0U;
+    const bool use_factored = use_v2 ? false : ((n % 32U) == 0U && ((n / bsz) % 2U) == 0U);
     const size_t blocks_per_axis = static_cast<size_t>(n / bsz);
     const size_t matrix_elems = use_v2 ? (2 * nn) : (use_factored ? (2 * nn) : 0);
     const size_t factored_rhs_elems =
@@ -102,7 +102,8 @@ int AutoBatchCapForDevice(int device)
     if (total >= 12ULL * 1024 * 1024 * 1024) {
         return 131072;
     }
-    if (total >= 8ULL * 1024 * 1024 * 1024) {
+    // 8192 MiB cards often report totalGlobalMem just under 8 GiB.
+    if (total >= 7ULL * 1024 * 1024 * 1024) {
         return 65536;
     }
     return 32768;
@@ -110,7 +111,7 @@ int AutoBatchCapForDevice(int device)
 
 int AutoBatchSizeForDevice(int device, const pow::MatMulJob& job, int max_cap)
 {
-    constexpr size_t kReserveBytes = 128 * 1024 * 1024;
+    constexpr size_t kReserveBytes = 64 * 1024 * 1024;
     const size_t free_bytes = GetDeviceFreeMemBytes(device);
     if (free_bytes <= kReserveBytes) {
         return 1024;

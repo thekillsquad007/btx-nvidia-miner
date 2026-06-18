@@ -729,6 +729,32 @@ __device__ __forceinline__ uint32_t d_mul(uint32_t a, uint32_t b)
 
 constexpr uint32_t kReduceInterval = 4;
 
+__device__ __forceinline__ uint32_t d_block_reduce_add_u32(uint32_t val)
+{
+    __shared__ uint32_t warp_sums[8];
+    const uint32_t lane = threadIdx.x & 31U;
+    const uint32_t warp_id = threadIdx.x >> 5U;
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val = d_add(val, __shfl_down_sync(0xffffffffU, val, offset));
+    }
+    if (lane == 0) {
+        warp_sums[warp_id] = val;
+    }
+    __syncthreads();
+
+    val = 0;
+    if (threadIdx.x < 8U) {
+        val = warp_sums[threadIdx.x];
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset >>= 1) {
+            val = d_add(val, __shfl_down_sync(0xffU, val, offset));
+        }
+    }
+    return val;
+}
+
 __device__ __forceinline__ uint64_t d_reduce64(uint64_t acc)
 {
     uint64_t fold = (acc & kFieldModulus) + (acc >> 31);
@@ -1869,6 +1895,75 @@ __global__ void batch_perturb_matrix_512x8_kernel(
         static_cast<uint32_t>(d_reduce64(acc)));
 }
 
+__global__ void batch_perturb_pair_512x8_kernel(
+    const uint32_t* __restrict__ base_a,
+    const uint32_t* __restrict__ base_b,
+    const uint32_t* __restrict__ noise_el,
+    const uint32_t* __restrict__ noise_er,
+    const uint32_t* __restrict__ noise_fl,
+    const uint32_t* __restrict__ noise_fr,
+    size_t matrix_elements,
+    uint32_t* __restrict__ output_a,
+    uint32_t* __restrict__ output_b)
+{
+    const size_t gid =
+        static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = matrix_elements * 2;
+    if (gid >= total) {
+        return;
+    }
+
+    constexpr uint32_t kN = 512;
+    constexpr size_t kMatrixElements = size_t{kN} * kN;
+    constexpr size_t kNoiseElements = size_t{kN} * 8;
+
+    if (gid < matrix_elements) {
+        const size_t batch_index = gid >> 18U;
+        const uint32_t local_index =
+            static_cast<uint32_t>(gid & (kMatrixElements - 1U));
+        const uint32_t row = local_index >> 9U;
+        const uint32_t col = local_index & (kN - 1U);
+        const uint32_t* batch_base = base_a + batch_index * kMatrixElements;
+        const uint32_t* left = noise_el + batch_index * kNoiseElements;
+        const uint32_t* right = noise_er + batch_index * kNoiseElements;
+        uint64_t acc = 0;
+        #pragma unroll
+        for (uint32_t k = 0; k < 8; ++k) {
+            acc += static_cast<uint64_t>(left[(row << 3U) + k]) *
+                   right[k * kN + col];
+            if ((k & 3U) == 3U) {
+                acc = d_reduce64(acc);
+            }
+        }
+        output_a[gid] = d_add(
+            batch_base[local_index],
+            static_cast<uint32_t>(d_reduce64(acc)));
+        return;
+    }
+
+    const size_t gid_b = gid - matrix_elements;
+    const size_t batch_index = gid_b >> 18U;
+    const uint32_t local_index =
+        static_cast<uint32_t>(gid_b & (kMatrixElements - 1U));
+    const uint32_t row = local_index >> 9U;
+    const uint32_t col = local_index & (kN - 1U);
+    const uint32_t* batch_base = base_b + batch_index * kMatrixElements;
+    const uint32_t* left = noise_fl + batch_index * kNoiseElements;
+    const uint32_t* right = noise_fr + batch_index * kNoiseElements;
+    uint64_t acc = 0;
+    #pragma unroll
+    for (uint32_t k = 0; k < 8; ++k) {
+        acc += static_cast<uint64_t>(left[(row << 3U) + k]) *
+               right[k * kN + col];
+        if ((k & 3U) == 3U) {
+            acc = d_reduce64(acc);
+        }
+    }
+    output_b[gid_b] = d_add(
+        batch_base[local_index],
+        static_cast<uint32_t>(d_reduce64(acc)));
+}
+
 __global__ void batch_compressed_words_kernel(
     const uint32_t* __restrict__ matrix_a,
     const uint32_t* __restrict__ matrix_b,
@@ -1880,8 +1975,6 @@ __global__ void batch_compressed_words_kernel(
     size_t matrix_elements,
     uint32_t* __restrict__ output)
 {
-    __shared__ uint32_t partials[256];
-
     const uint32_t global_word = blockIdx.x;
     const uint32_t batch_index = global_word / words_per_nonce;
     const uint32_t word_index = global_word % words_per_nonce;
@@ -1896,14 +1989,15 @@ __global__ void batch_compressed_words_kernel(
     const uint32_t* B = matrix_b + static_cast<size_t>(batch_index) * matrix_elements;
     const uint32_t* W = compress + static_cast<size_t>(batch_index) * bsz * bsz;
 
-    uint32_t compressed_sum = 0;
-    for (uint32_t ell = 0; ell < blocks_per_axis; ++ell) {
-        uint64_t dot = 0;
-        uint32_t pending = 0;
-        if (active) {
-            const uint32_t row = bi * bsz + x;
-            const uint32_t col = bj * bsz + y;
+    uint32_t thread_sum = 0;
+    if (active) {
+        const uint32_t row = bi * bsz + x;
+        const uint32_t col = bj * bsz + y;
+        const uint32_t weight = W[tid];
+        for (uint32_t ell = 0; ell < blocks_per_axis; ++ell) {
             const uint32_t middle = ell * bsz;
+            uint64_t dot = 0;
+            uint32_t pending = 0;
             #pragma unroll
             for (uint32_t k = 0; k < 16; ++k) {
                 if (k < bsz) {
@@ -1916,25 +2010,13 @@ __global__ void batch_compressed_words_kernel(
                     }
                 }
             }
-            partials[tid] = d_mul(
-                static_cast<uint32_t>(d_reduce64(dot)), W[tid]);
-        } else {
-            partials[tid] = 0;
+            thread_sum = d_add(
+                thread_sum,
+                d_mul(static_cast<uint32_t>(d_reduce64(dot)), weight));
         }
-        __syncthreads();
-
-        for (uint32_t stride = 128; stride > 0; stride >>= 1U) {
-            if (tid < stride) {
-                partials[tid] = d_add(partials[tid], partials[tid + stride]);
-            }
-            __syncthreads();
-        }
-        if (tid == 0) {
-            compressed_sum = d_add(compressed_sum, partials[0]);
-        }
-        __syncthreads();
     }
 
+    const uint32_t compressed_sum = d_block_reduce_add_u32(thread_sum);
     if (tid == 0) {
         output[static_cast<size_t>(batch_index) * words_per_nonce + word_index] =
             compressed_sum;
@@ -1947,8 +2029,6 @@ __global__ void batch_compressed_words_512x16_kernel(
     const uint32_t* __restrict__ compress,
     uint32_t* __restrict__ output)
 {
-    __shared__ uint32_t partials[256];
-
     constexpr uint32_t kN = 512;
     constexpr uint32_t kWordsPerNonce = 32 * 32;
     constexpr size_t kMatrixElements = size_t{kN} * kN;
@@ -1968,7 +2048,7 @@ __global__ void batch_compressed_words_512x16_kernel(
     const uint32_t weight =
         compress[(static_cast<size_t>(batch_index) << 8U) + tid];
 
-    uint32_t compressed_sum = 0;
+    uint32_t thread_sum = 0;
     for (uint32_t ell = 0; ell < 32; ++ell) {
         const uint32_t middle = ell << 4U;
         uint64_t dot = 0;
@@ -1981,22 +2061,12 @@ __global__ void batch_compressed_words_512x16_kernel(
                 dot = d_reduce64(dot);
             }
         }
-        partials[tid] = d_mul(
-            static_cast<uint32_t>(d_reduce64(dot)), weight);
-        __syncthreads();
-
-        for (uint32_t stride = 128; stride > 0; stride >>= 1U) {
-            if (tid < stride) {
-                partials[tid] = d_add(partials[tid], partials[tid + stride]);
-            }
-            __syncthreads();
-        }
-        if (tid == 0) {
-            compressed_sum = d_add(compressed_sum, partials[0]);
-        }
-        __syncthreads();
+        thread_sum = d_add(
+            thread_sum,
+            d_mul(static_cast<uint32_t>(d_reduce64(dot)), weight));
     }
 
+    const uint32_t compressed_sum = d_block_reduce_add_u32(thread_sum);
     if (tid == 0) {
         output[
             (static_cast<size_t>(batch_index) << 10U) + word_index] =
@@ -2458,12 +2528,13 @@ bool ProcessPassedNoncesBatched(
         (total_matrix_elements + kThreads - 1) / kThreads);
     const bool use_512x16x8 = n == 512 && bsz == 16 && r == 8;
     if (use_512x16x8) {
-        batch_perturb_matrix_512x8_kernel<<<matrix_blocks, kThreads, 0, stream>>>(
-            pool.d_base_a, pool.d_noise_el, pool.d_noise_er,
-            total_matrix_elements, pool.d_matrix_a);
-        batch_perturb_matrix_512x8_kernel<<<matrix_blocks, kThreads, 0, stream>>>(
-            pool.d_base_b, pool.d_noise_fl, pool.d_noise_fr,
-            total_matrix_elements, pool.d_matrix_b);
+        const uint32_t pair_blocks = static_cast<uint32_t>(
+            ((total_matrix_elements * 2) + kThreads - 1) / kThreads);
+        batch_perturb_pair_512x8_kernel<<<pair_blocks, kThreads, 0, stream>>>(
+            pool.d_base_a, pool.d_base_b,
+            pool.d_noise_el, pool.d_noise_er,
+            pool.d_noise_fl, pool.d_noise_fr,
+            matrix_elements, pool.d_matrix_a, pool.d_matrix_b);
     } else {
         batch_perturb_matrix_kernel<<<matrix_blocks, kThreads, 0, stream>>>(
             pool.d_base_a, pool.d_noise_el, pool.d_noise_er, n, r,
@@ -2631,13 +2702,13 @@ bool CollectScatteredHits(
 
     if (pool.use_batched_matmul) {
         BatchedMatMulPool& bp = g_batched_pool[device];
-        if (cudaMemset(pool.d_found, 0, launch_batch) != cudaSuccess) {
+        if (cudaMemsetAsync(pool.d_found, 0, launch_batch, 0) != cudaSuccess) {
             return false;
         }
         constexpr int kScatterThreads = 256;
         const int scatter_blocks =
             static_cast<int>((passed + kScatterThreads - 1) / kScatterThreads);
-        scatter_passed_hits_kernel<<<scatter_blocks, kScatterThreads>>>(
+        scatter_passed_hits_kernel<<<scatter_blocks, kScatterThreads, 0, 0>>>(
             pool.d_passed_indices,
             bp.d_results,
             bp.d_digests,
@@ -2646,7 +2717,7 @@ bool CollectScatteredHits(
             pool.d_digests,
             launch_batch);
         if (cudaGetLastError() != cudaSuccess ||
-            cudaDeviceSynchronize() != cudaSuccess) {
+            cudaStreamSynchronize(0) != cudaSuccess) {
             return false;
         }
 

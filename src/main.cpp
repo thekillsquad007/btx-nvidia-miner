@@ -1,3 +1,5 @@
+#include <chrono>
+#include <cstring>
 #include <cstdlib>
 #include <iostream>
 #include <sstream>
@@ -41,7 +43,8 @@ Common:
                             Interval: BTX_AUTO_UPDATE_INTERVAL_SEC (default 1800)
   --slice-seconds <n>       Time-limit each mining slice in seconds (default: 5)
   --verbose                 Extra stratum debug logging
-  --benchmark               Run a short throughput test (CPU ref + CUDA if available)
+  --benchmark               Run CPU smoke test + GPU throughput benchmark
+  --benchmark-seconds <n>   GPU benchmark duration (default: 20)
   --no-gpu                  Force CPU reference path only
   --dev-fee <pct>           Dev fee percent 0-5 (default: 1, or BTX_DEV_FEE_PCT)
   -h, --help                This help
@@ -145,6 +148,7 @@ int main(int argc, char** argv)
     std::string user;
     std::string pass = "x";
     bool do_bench = false;
+    int bench_seconds = 20;
     bool force_cpu = false;
     bool verbose = false;
     bool print_gpu_batch = false;
@@ -163,6 +167,7 @@ int main(int argc, char** argv)
         if (a == "-h" || a == "--help") { print_help(); return 0; }
         if (a == "--version") { std::cout << "btx-miner v" << btx::common::kMinerVersion << std::endl; return 0; }
         if (a == "--benchmark") do_bench = true;
+        if (a == "--benchmark-seconds" && i+1 < argc) bench_seconds = std::atoi(argv[++i]);
         if (a == "--no-gpu") force_cpu = true;
         if (a == "--verbose") verbose = true;
         if (a == "--solo") mode = "solo";
@@ -280,6 +285,49 @@ int main(int argc, char** argv)
                 std::cout << devices[d];
             }
             std::cout << std::endl;
+
+            btx::pow::MatMulJob bench_job;
+            bench_job.n = 512;
+            bench_job.b = 16;
+            bench_job.r = 8;
+            bench_job.version = 536870912;
+            bench_job.time = 1775000000u;
+            bench_job.bits = 0x1d0b8746;
+            bench_job.block_height = btx::pow::kMatMulSeedV2Height;
+            bench_job.epsilon_bits = 18;
+            bench_job.target.assign(32, 0xff);
+            std::memset(bench_job.prev_hash.data(), 0x01, 32);
+            std::memset(bench_job.merkle_root.data(), 0x02, 32);
+            std::memset(bench_job.seed_a.data(), 0x11, 32);
+            std::memset(bench_job.seed_b.data(), 0x22, 32);
+
+            btx::cuda::PrintGpuBatchPlan(batch_config, bench_job);
+
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto deadline = t0 + std::chrono::seconds(bench_seconds);
+            uint64_t nonce = 1'000'000;
+            uint64_t total_nonces = 0;
+            const uint64_t chunk = static_cast<uint64_t>(
+                std::max(131072, btx::cuda::RecommendJobChunkSize(batch_config, bench_job)));
+
+            std::cout << "GPU benchmark (" << bench_seconds << "s, chunk="
+                      << chunk << ")..." << std::endl;
+            while (std::chrono::steady_clock::now() < deadline) {
+                (void)btx::cuda::SolveBatchCuda(bench_job, nonce, chunk, batch_config);
+                total_nonces += chunk;
+                nonce += chunk;
+            }
+            const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            const double total_rate =
+                elapsed_ms > 0
+                    ? static_cast<double>(total_nonces) * 1000.0 /
+                      static_cast<double>(elapsed_ms)
+                    : 0.0;
+            std::cout << "GPU total: " << static_cast<uint64_t>(total_rate)
+                      << " nonces/s over " << total_nonces << " nonces ("
+                      << elapsed_ms << " ms)" << std::endl;
+            std::cout << btx::cuda::FormatGpuHashrateLog() << std::endl;
         } else {
             std::cout << "CUDA compiled in but no usable GPU at runtime." << std::endl;
         }
