@@ -1700,36 +1700,58 @@ __global__ void sigma_gate_kernel(
     uint8_t* __restrict__ out_seed_a,
     uint8_t* __restrict__ out_seed_b)
 {
+    __shared__ uint32_t block_count;
+    __shared__ uint32_t block_base;
+
     const size_t idx =
         static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= nonce_count) {
-        return;
-    }
 
+    if (threadIdx.x == 0) {
+        block_count = 0;
+    }
+    __syncthreads();
+
+    bool gate_pass = false;
     uint8_t seed_a[32];
     uint8_t seed_b[32];
     uint8_t sigma[32];
-    const uint64_t nonce = nonce_start + idx;
 
-    if (params.block_height >= 125000) {
-        d_matmul_seed_fast(seed_midstate, params, nonce, 0, seed_a);
-        d_matmul_seed_fast(seed_midstate, params, nonce, 1, seed_b);
-        d_derive_sigma_fast(
-            header_midstate, params, nonce, seed_a, seed_b, sigma);
-    } else {
-        for (uint32_t i = 0; i < 32; ++i) {
-            seed_a[i] = params.seed_a[i];
-            seed_b[i] = params.seed_b[i];
+    if (idx < nonce_count) {
+        const uint64_t nonce = nonce_start + idx;
+
+        if (params.block_height >= 125000) {
+            d_matmul_seed_fast(seed_midstate, params, nonce, 0, seed_a);
+            d_matmul_seed_fast(seed_midstate, params, nonce, 1, seed_b);
+            d_derive_sigma_fast(
+                header_midstate, params, nonce, seed_a, seed_b, sigma);
+        } else {
+            for (uint32_t i = 0; i < 32; ++i) {
+                seed_a[i] = params.seed_a[i];
+                seed_b[i] = params.seed_b[i];
+            }
+            d_derive_sigma(params, nonce, seed_a, seed_b, sigma);
         }
-        d_derive_sigma(params, nonce, seed_a, seed_b, sigma);
+
+        gate_pass = params.epsilon_bits == 0 ||
+                    d_sigma_below_prehash(sigma, params.pre_hash_target);
     }
 
-    if (params.epsilon_bits != 0 &&
-        !d_sigma_below_prehash(sigma, params.pre_hash_target)) {
+    uint32_t slot = 0;
+    if (gate_pass) {
+        slot = atomicAdd(&block_count, 1u);
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0 && block_count > 0) {
+        block_base = atomicAdd(out_count, block_count);
+    }
+    __syncthreads();
+
+    if (!gate_pass) {
         return;
     }
 
-    const uint32_t compact_index = atomicAdd(out_count, 1u);
+    const uint32_t compact_index = block_base + slot;
     out_indices[compact_index] = static_cast<uint32_t>(idx);
     for (uint32_t i = 0; i < 32; ++i) {
         out_sigma[compact_index * 32 + i] = sigma[i];
@@ -2607,37 +2629,54 @@ bool CollectScatteredHits(
         return false;
     }
 
+    if (pool.use_batched_matmul) {
+        BatchedMatMulPool& bp = g_batched_pool[device];
+        if (cudaMemset(pool.d_found, 0, launch_batch) != cudaSuccess) {
+            return false;
+        }
+        constexpr int kScatterThreads = 256;
+        const int scatter_blocks =
+            static_cast<int>((passed + kScatterThreads - 1) / kScatterThreads);
+        scatter_passed_hits_kernel<<<scatter_blocks, kScatterThreads>>>(
+            pool.d_passed_indices,
+            bp.d_results,
+            bp.d_digests,
+            passed,
+            pool.d_found,
+            pool.d_digests,
+            launch_batch);
+        if (cudaGetLastError() != cudaSuccess ||
+            cudaDeviceSynchronize() != cudaSuccess) {
+            return false;
+        }
+
+        std::vector<uint8_t> found_flags(launch_batch, 0);
+        std::vector<uint8_t> digests(launch_batch * 32);
+        if (cudaMemcpy(
+                found_flags.data(), pool.d_found, launch_batch,
+                cudaMemcpyDeviceToHost) != cudaSuccess) {
+            return false;
+        }
+        if (cudaMemcpy(
+                digests.data(), pool.d_digests, launch_batch * 32,
+                cudaMemcpyDeviceToHost) != cudaSuccess) {
+            return false;
+        }
+        for (size_t i = 0; i < launch_batch; ++i) {
+            out_found[i] = found_flags[i] != 0;
+            if (out_found[i]) {
+                std::memcpy(
+                    out_digests[i].data(), digests.data() + i * 32, 32);
+            }
+        }
+        return true;
+    }
+
     std::vector<uint32_t> indices(passed);
     if (cudaMemcpy(
             indices.data(), pool.d_passed_indices, passed * sizeof(uint32_t),
             cudaMemcpyDeviceToHost) != cudaSuccess) {
         return false;
-    }
-
-    if (pool.use_batched_matmul) {
-        BatchedMatMulPool& bp = g_batched_pool[device];
-        std::vector<int32_t> results(passed);
-        if (cudaMemcpy(
-                results.data(), bp.d_results, passed * sizeof(int32_t),
-                cudaMemcpyDeviceToHost) != cudaSuccess) {
-            return false;
-        }
-        for (uint32_t i = 0; i < passed; ++i) {
-            if (results[i] == 0) {
-                continue;
-            }
-            const uint32_t idx = indices[i];
-            if (idx >= launch_batch) {
-                continue;
-            }
-            out_found[idx] = true;
-            if (cudaMemcpy(
-                    out_digests[idx].data(), bp.d_digests + static_cast<size_t>(i) * 32, 32,
-                    cudaMemcpyDeviceToHost) != cudaSuccess) {
-                return false;
-            }
-        }
-        return true;
     }
 
     std::vector<uint8_t> found(passed);
