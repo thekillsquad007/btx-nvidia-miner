@@ -140,7 +140,7 @@ curl -fsSL https://raw.githubusercontent.com/thekillsquad007/btx-nvidia-miner/ma
 
 - Downloads the latest prebuilt release binary (NVIDIA driver + CUDA runtime only — no nvcc).
 - Installs to `~/.local/bin/btx-miner` and prints ready-to-run commands (dev fee is automatic).
-- If a CDN serves a stale installer, pin the release: add `--version 0.2.32` to the command above.
+- If a CDN serves a stale installer, pin the release: add `--version 0.3.00` to the command above.
 - Run the resulting binary in tmux/screen or as a service.
 
 See `install.sh` and `docs/BUILD.md` for details and options.
