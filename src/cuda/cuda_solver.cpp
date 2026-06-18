@@ -94,19 +94,19 @@ int AutoBatchCapForDevice(int device)
 {
     const size_t total = GetDeviceTotalMemBytes(device);
     if (total >= 28ULL * 1024 * 1024 * 1024) {
-        return 262144;
+        return 4194304;  // 4M
     }
     if (total >= 20ULL * 1024 * 1024 * 1024) {
-        return 262144;
+        return 4194304;
     }
     if (total >= 12ULL * 1024 * 1024 * 1024) {
-        return 131072;
+        return 16777216;  // 16M
     }
     // 8192 MiB cards often report totalGlobalMem just under 8 GiB.
     if (total >= 7ULL * 1024 * 1024 * 1024) {
-        return 65536;
+        return 8388608;  // 8M -- gate path is low-mem for high epsilon; full work only on rare passes
     }
-    return 32768;
+    return 2097152;
 }
 
 int AutoBatchSizeForDevice(int device, const pow::MatMulJob& job, int max_cap)
@@ -160,7 +160,7 @@ int ResolveLaunchBatch(
 int MaxResolvedLaunchBatch(const BatchLaunchConfig& config, const pow::MatMulJob& job)
 {
     const auto active = GetActiveDevices();
-    int max_batch = 65536;
+    int max_batch = 4194304;
     for (size_t i = 0; i < active.size(); ++i) {
         max_batch = std::max(max_batch, ResolveLaunchBatch(active[i], i, config, job));
     }
@@ -169,7 +169,10 @@ int MaxResolvedLaunchBatch(const BatchLaunchConfig& config, const pow::MatMulJob
 
 int RecommendJobChunkSize(const BatchLaunchConfig& config, const pow::MatMulJob& job)
 {
-    return std::max(131072, MaxResolvedLaunchBatch(config, job) * 2);
+    const int n = std::max(1, static_cast<int>(GetActiveDevices().size()));
+    // Use large outer chunks so multi-GPU dispatch with big per-GPU launch batches keeps all GPUs fed.
+    // 8-16x launch batch per GPU gives good overlap without excessive re-syncs.
+    return std::max(4194304, MaxResolvedLaunchBatch(config, job) * n * 4);
 }
 
 void PrintGpuBatchPlan(const BatchLaunchConfig& config, const pow::MatMulJob& job)
@@ -395,11 +398,9 @@ std::vector<CudaSolution> SolveBatchCuda(
             return SolveOnDevice(usable[0], job, start_nonce, max_tries, launch_batch);
         }
 
-        // Multi-GPU: dynamic work queue — fast GPUs pull more nonce batches.
+        // Multi-GPU: partition the nonce range into contiguous slices (one per GPU).
+        // Large contiguous solves allow internal pipelining/batching to keep each GPU fully busy.
         const size_t n = usable.size();
-        const uint64_t slice_end = start_nonce + max_tries;
-        std::atomic<uint64_t> next_nonce{start_nonce};
-
         struct DevResult {
             std::mutex mu;
             std::vector<CudaSolution> solutions;
@@ -409,23 +410,15 @@ std::vector<CudaSolution> SolveBatchCuda(
         workers.reserve(n);
         for (size_t i = 0; i < n; ++i) {
             const int launch_batch = ResolveLaunchBatch(usable[i], i, batch_config, job);
-            workers.emplace_back([&, i, launch_batch]() {
-                std::vector<CudaSolution> local;
-                while (true) {
-                    const uint64_t batch_start =
-                        next_nonce.fetch_add(static_cast<uint64_t>(launch_batch));
-                    if (batch_start >= slice_end) {
-                        break;
-                    }
-                    const uint64_t batch_count =
-                        std::min<uint64_t>(static_cast<uint64_t>(launch_batch),
-                                           slice_end - batch_start);
-                    auto sols = SolveOnDevice(usable[i], job, batch_start, batch_count, launch_batch);
-                    local.insert(local.end(), sols.begin(), sols.end());
-                }
-                if (!local.empty()) {
+            const uint64_t my_start = start_nonce + (max_tries * i / n);
+            const uint64_t my_end = start_nonce + (max_tries * (i + 1) / n);
+            const uint64_t my_count = (my_end > my_start) ? (my_end - my_start) : 0;
+            workers.emplace_back([&, i, launch_batch, my_start, my_count]() {
+                if (my_count == 0) return;
+                auto sols = SolveOnDevice(usable[i], job, my_start, my_count, launch_batch);
+                if (!sols.empty()) {
                     std::lock_guard<std::mutex> lk(merged.mu);
-                    merged.solutions.insert(merged.solutions.end(), local.begin(), local.end());
+                    merged.solutions.insert(merged.solutions.end(), sols.begin(), sols.end());
                 }
             });
         }
