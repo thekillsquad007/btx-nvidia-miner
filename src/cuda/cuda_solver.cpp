@@ -103,8 +103,11 @@ int AutoBatchCapForDevice(int device)
         return 16777216;  // 16M
     }
     // 8192 MiB cards often report totalGlobalMem just under 8 GiB.
+    if (total >= 32ULL * 1024 * 1024 * 1024) {
+        return 16777216; // 16M for high VRAM like 5090
+    }
     if (total >= 7ULL * 1024 * 1024 * 1024) {
-        return 8388608;  // 8M -- gate path is low-mem for high epsilon; full work only on rare passes
+        return 4194304;  // 4M safe for 8GB cards (launch pool buffers for large batches + headroom)
     }
     return 2097152;
 }
@@ -118,7 +121,7 @@ int AutoBatchSizeForDevice(int device, const pow::MatMulJob& job, int max_cap)
     }
 
     const int cap = max_cap > 0 ? max_cap : AutoBatchCapForDevice(device);
-    const size_t usable = static_cast<size_t>((free_bytes - kReserveBytes) * 0.85);
+    const size_t usable = static_cast<size_t>((free_bytes - kReserveBytes) * 0.70); // more headroom for large launch batches + kernel temps
 
     // Gate-path VRAM is mostly fixed pools + O(batch) gate buffers — not
     // LaunchBatchBytes(job,1) per nonce. Binary-search the largest batch that fits.
@@ -299,6 +302,17 @@ std::vector<CudaSolution> SolveOnDevice(
         if (!LaunchMatMulTranscriptBatch(
                 dev, job, current_nonce, batch, job.target,
                 pending_digests, pending_found)) {
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                static bool logged = false;
+                if (!logged) {
+                    logged = true;
+                    std::cerr << "[cuda] kernel launch failed on GPU " << dev
+                              << ": " << cudaGetErrorString(err)
+                              << " (likely missing arch support for this GPU in the binary; "
+                              << "rebuild with -DCUDA_ARCHS=\"120\" or \"native\" on a machine with CUDA 12.8+)" << std::endl;
+                }
+            }
             break;
         }
         pipeline_pending = true;
@@ -387,7 +401,13 @@ std::vector<CudaSolution> SolveBatchCuda(
 ) {
     if (max_tries == 0) return {};
     if (job.block_height >= pow::kMatMulSeedV3Height && !job.has_parent_mtp) {
-        return {};
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::cerr << "[stratum] V3 job (height=" << job.block_height
+                      << ") without parent_mtp; proceeding with 0 (some pools like minebtx omit it but other miners work)" << std::endl;
+        }
+        // do not return; proceed (parent_mtp=0 will be used in seed derivation)
     }
 
 #ifdef BTX_MINER_HAS_CUDA

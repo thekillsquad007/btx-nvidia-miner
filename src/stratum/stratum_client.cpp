@@ -834,15 +834,21 @@ void StratumClient::Impl::solver_loop() {
         const uint64_t next_nonce = cursor;
 
         ++slices_processed;
-        const double nps = nonces_tried > 0
-            ? (1000.0 * static_cast<double>(nonces_tried) / std::max<int64_t>(elapsed_ms, 1))
+        // Guard against bogus "tried" counts when Solve bailed early (e.g. arch mismatch, no parent_mtp, launch failure)
+        // If wall time is tiny for millions of nonces, treat as zero real work.
+        uint64_t effective_tried = nonces_tried;
+        if (elapsed_ms < 5 && nonces_tried > 1000000) {
+            effective_tried = 0;
+        }
+        const double nps = effective_tried > 0
+            ? (1000.0 * static_cast<double>(effective_tried) / std::max<int64_t>(elapsed_ms, 1))
             : 0.0;
         LogLine("[stratum] slice done job=" + job.job_id +
                 " start=" + std::to_string(slice_start) +
                 " end=" + std::to_string(next_nonce) +
                 " tried=" + std::to_string(nonces_tried) +
                 " found=" + std::to_string(found_count) +
-                " " + std::to_string(static_cast<int>(nps)) + " nonces/s" +
+                " " + (nps > 0 ? std::to_string(static_cast<long long>(std::min(nps, 1.0e18))) : std::string("0")) + " nonces/s" +
                 " (" + std::to_string(elapsed_ms) + "ms)");
         LogLine("[stratum] " + btx::cuda::FormatGpuHashrateLog());
         if (slices_processed % 10 == 0) {

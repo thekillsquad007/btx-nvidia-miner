@@ -377,7 +377,9 @@ bool StratumJobToPowJob(const StratumJob& job, pow::MatMulJob& out)
     out.parent_mtp = job.parent_mtp;
     out.has_parent_mtp = job.has_parent_mtp;
     if (out.block_height >= pow::kMatMulSeedV3Height && !out.has_parent_mtp) {
-        return false;
+        // Some pools (e.g. minebtx) send V3 jobs (high block_height) without parent_mtp in matmul_meta.
+        // Proceed with 0 (may or may not produce valid shares depending on pool).
+        // Other miners apparently work without it on this pool.
     }
 
     if (!job.bits.empty()) {

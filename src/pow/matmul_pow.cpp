@@ -482,12 +482,12 @@ bool VerifySolution(const MatMulJob& job, uint64_t nonce, uint32_t ntime, uint25
     const uint32_t use_time = ntime ? ntime : job.time;
 
     if (job.block_height >= kMatMulSeedV3Height && !job.has_parent_mtp) {
-        return false;
+        // proceed (using parent_mtp=0); some pools omit the field for V3 jobs
     }
 
     uint256 seed_a = job.seed_a;
     uint256 seed_b = job.seed_b;
-    if (job.block_height >= kMatMulSeedV3Height) {
+    if (job.block_height >= kMatMulSeedV3Height && job.has_parent_mtp) {
         seed_a = DeterministicMatMulSeedV3(
             job.prev_hash, job.parent_mtp, static_cast<int32_t>(job.block_height),
             job.version, job.merkle_root, use_time, job.bits, nonce, dim, 0);

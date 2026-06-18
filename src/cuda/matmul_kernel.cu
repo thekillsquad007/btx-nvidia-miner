@@ -64,6 +64,7 @@ struct CudaJobParams {
     uint32_t epsilon_bits;
     uint32_t block_height;
     int64_t parent_mtp;
+    int has_parent_mtp;
     uint8_t prev_hash[32];
     uint8_t merkle_root[32];
     uint8_t seed_a[32];
@@ -663,7 +664,7 @@ __device__ uint32_t d_build_matmul_seed_message(
     uint32_t offset = 0;
     static const char kTagV2[] = "BTX_MATMUL_SEED_V2";
     static const char kTagV3[] = "BTX_MATMUL_SEED_V3";
-    const bool use_v3 = job.block_height >= btx::pow::kMatMulSeedV3Height;
+    const bool use_v3 = job.block_height >= btx::pow::kMatMulSeedV3Height && job.has_parent_mtp;
     const char* tag = use_v3 ? kTagV3 : kTagV2;
     d_append_byte(message, offset, 18U);
     d_append_bytes(message, offset, reinterpret_cast<const uint8_t*>(tag), 18U);
@@ -1464,7 +1465,7 @@ __device__ bool d_solve_nonce(
     __shared__ uint32_t s_tx_count;
 
     const bool use_v2 = job.block_height >= 125000;
-    const bool use_v3 = job.block_height >= btx::pow::kMatMulSeedV3Height;
+    const bool use_v3 = job.block_height >= btx::pow::kMatMulSeedV3Height && job.has_parent_mtp;
     const bool use_factored = use_v2 ? false : d_use_factored_path(job.n, job.b);
 
     if (threadIdx.x == 0 && use_v2) {
@@ -1819,7 +1820,7 @@ __global__ __launch_bounds__(512) void sigma_gate_kernel(
             g_gate_nonce_start != 0ULL ? g_gate_nonce_start : nonce_start;
         const uint64_t nonce = base_nonce + idx;
 
-        if (params.block_height >= 125000) {
+        if (params.block_height >= 125000 && params.has_parent_mtp) {
             d_matmul_seeds_pair_fast(
                 seed_midstate, params, nonce, seed_a, seed_b);
             d_derive_sigma_fast(
@@ -2341,11 +2342,11 @@ bool EnsureBatchedPool(
     pool.device = device;
     pool.capacity = bucket;
 
-    const size_t matrix = batch * static_cast<size_t>(n) * n;
-    const size_t noise_left = batch * static_cast<size_t>(n) * r;
-    const size_t noise_right = batch * static_cast<size_t>(r) * n;
-    const size_t compress = batch * static_cast<size_t>(bsz) * bsz;
-    const size_t words = batch * static_cast<size_t>(n / bsz) * (n / bsz);
+    const size_t matrix = bucket * static_cast<size_t>(n) * n;
+    const size_t noise_left = bucket * static_cast<size_t>(n) * r;
+    const size_t noise_right = bucket * static_cast<size_t>(r) * n;
+    const size_t compress = bucket * static_cast<size_t>(bsz) * bsz;
+    const size_t words = bucket * static_cast<size_t>(n / bsz) * (n / bsz);
 
     const bool ok =
         CudaAlloc(pool.d_noise_seeds, batch * 4 * 32) &&
@@ -2692,7 +2693,7 @@ bool EnsureBatchedGraph(
         return false;
     }
 
-    if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal) != cudaSuccess) {
+    if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed) != cudaSuccess) {
         return false;
     }
     LaunchBatchedPipelineKernels(
@@ -2902,7 +2903,7 @@ bool EnsureGateGraph(
         return false;
     }
 
-    if (cudaStreamBeginCapture(pool.gate_stream, cudaStreamCaptureModeGlobal) !=
+    if (cudaStreamBeginCapture(pool.gate_stream, cudaStreamCaptureModeRelaxed) !=
         cudaSuccess) {
         return false;
     }
@@ -3021,13 +3022,13 @@ bool CollectScatteredHits(
 
     if (pool.use_batched_matmul) {
         BatchedMatMulPool& bp = g_batched_pool[device];
-        if (cudaMemsetAsync(pool.d_found, 0, launch_batch, 0) != cudaSuccess) {
+        if (cudaMemsetAsync(pool.d_found, 0, launch_batch, pool.matmul_stream) != cudaSuccess) {
             return false;
         }
         constexpr int kScatterThreads = 256;
         const int scatter_blocks =
             static_cast<int>((passed + kScatterThreads - 1) / kScatterThreads);
-        scatter_passed_hits_kernel<<<scatter_blocks, kScatterThreads, 0, 0>>>(
+        scatter_passed_hits_kernel<<<scatter_blocks, kScatterThreads, 0, pool.matmul_stream>>>(
             pool.d_passed_indices,
             bp.d_results,
             bp.d_digests,
@@ -3036,7 +3037,7 @@ bool CollectScatteredHits(
             pool.d_digests,
             launch_batch);
         if (cudaGetLastError() != cudaSuccess ||
-            cudaStreamSynchronize(0) != cudaSuccess) {
+            cudaStreamSynchronize(pool.matmul_stream) != cudaSuccess) {
             return false;
         }
 
@@ -3108,6 +3109,7 @@ CudaJobParams MakeCudaJobParams(const btx::pow::MatMulJob& job, const std::vecto
     p.epsilon_bits = job.epsilon_bits;
     p.block_height = job.block_height;
     p.parent_mtp = job.parent_mtp;
+    p.has_parent_mtp = job.has_parent_mtp ? 1 : 0;
     std::memcpy(p.prev_hash, job.prev_hash.data(), 32);
     std::memcpy(p.merkle_root, job.merkle_root.data(), 32);
     std::memcpy(p.seed_a, job.seed_a.data(), 32);
@@ -3206,7 +3208,7 @@ extern "C" bool LaunchMatMulTranscriptBatch(
         return false;
     }
     if (job.block_height >= btx::pow::kMatMulSeedV3Height && !job.has_parent_mtp) {
-        return false;
+        // proceed with parent_mtp=0 for pools that omit the field
     }
 
     if (cudaSetDevice(device) != cudaSuccess) {
