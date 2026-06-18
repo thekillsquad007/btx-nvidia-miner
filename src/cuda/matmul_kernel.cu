@@ -1784,7 +1784,7 @@ __global__ void init_scan_midstates_kernel(
     }
 }
 
-__global__ void sigma_gate_kernel(
+__global__ __launch_bounds__(512) void sigma_gate_kernel(
     CudaJobParams params,
     uint64_t nonce_start,
     size_t nonce_count,
@@ -2864,7 +2864,7 @@ void LaunchGateKernels(
     uint32_t bucket_batch,
     cudaStream_t stream)
 {
-    constexpr int kGateThreads = 256;
+    constexpr int kGateThreads = 512;
     const int gate_blocks =
         static_cast<int>((bucket_batch + kGateThreads - 1) / kGateThreads);
     sigma_gate_kernel<<<gate_blocks, kGateThreads, 0, stream>>>(
